@@ -3,7 +3,6 @@ import os
 import random
 import time
 from dataclasses import dataclass, asdict, fields
-from env import make_minatar_env
 import argparse
 from typing import List
 import gymnasium as gym
@@ -103,24 +102,6 @@ if __name__ == "__main__":
     # args = tyro.cli(Args)
     args = parse_args()
     print(f"Args used for this expr: {args}")
-
-    # Environment setup
-    if args.exp_type == "ppo_metaworld":
-        from utils import make_metaworld_env
-        train_envs, test_envs = make_metaworld_env(args.env_ids, seed = args.seed)
-    elif args.exp_type == "ppo_minatar":
-        tasks=[]
-        for env_id in args.env_ids:
-            envs = gym.vector.SyncVectorEnv(
-                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
-            )
-            assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-            tasks.append(envs)
-        
-    else:
-        print(f"expr type not supported:{args.exp_type}")
-        exit(1)
-
     # example: args = Args(
     #     exp_name="PPO_minatar",
     #     seed=1,
@@ -139,7 +120,26 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_ids}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
+
+    # Environment setup
+    if args.exp_type == "ppo_metaworld":
+        from utils import make_metaworld_env
+        train_envs, test_envs = make_metaworld_env(args.env_ids, seed = args.seed)
+    elif args.exp_type == "ppo_minatar":
+        from env import make_minatar_env
+        tasks=[]
+        for env_id in args.env_ids:
+            envs = gym.vector.SyncVectorEnv(
+                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+            )
+            assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+            tasks.append(envs)
+        
+    else:
+        print(f"expr type not supported:{args.exp_type}")
+        exit(1)
+
+    if args.track and False:
         import wandb
 
         wandb.init(
@@ -184,9 +184,10 @@ if __name__ == "__main__":
 
             # ALGO Logic: Storage setup
             obs_space_shape = envs.observation_space.shape if args.exp_type == "ppo_metaworld" else envs.single_observation_space.shape
+            act_space_shape = envs.action_space.shape if args.exp_type == "ppo_metaworld" else envs.single_action_space.shape
 
             obs = torch.zeros((args.num_steps, args.num_envs) + obs_space_shape).to(device)
-            actions = torch.zeros((args.num_steps, args.num_envs) + obs_space_shape).to(device)
+            actions = torch.zeros((args.num_steps, args.num_envs) + act_space_shape).to(device)
             logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
             rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
             dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -207,6 +208,9 @@ if __name__ == "__main__":
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
                 obs[step] = next_obs
+                if args.exp_type == "ppo_metaworld" and next_done.nelement() == 0:
+                    # print("next_done invalid, reset as tensor([0.])")
+                    next_done = torch.zeros(args.num_envs).to(device)
                 dones[step] = next_done
 
                 # ALGO LOGIC: action logic
@@ -215,8 +219,10 @@ if __name__ == "__main__":
                 # next_obs = next_obs.view(next_obs.size(0), -1, 84, 84)
 
                 with torch.no_grad():
-                    next_obs_flattened = next_obs.view(next_obs.size(0), -1)
-                    action, logprob, _, value = agent.get_action_and_value(next_obs_flattened)
+                    if args.exp_type == "ppo_minatar":
+                        #flattened
+                        next_obs = next_obs.view(next_obs.size(0), -1)
+                    action, logprob, _, value = agent.get_action_and_value(next_obs)
 
                     values[step] = value.flatten()
                 actions[step] = action
@@ -241,9 +247,8 @@ if __name__ == "__main__":
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-                writer.add_scalar("charts/reward", reward, global_step)
-                
                 if args.exp_type == "ppo_metaworld":
+                    writer.add_scalar("charts/reward", reward, global_step)
                     writer.add_scalar("charts/success", infos["success"], global_step)
                     if "grasp_reward" in infos:
                         writer.add_scalar("charts/grasp_reward", infos["grasp_reward"], global_step)
@@ -305,7 +310,7 @@ if __name__ == "__main__":
                         # Reshape b_obs correctly for the actor network
                         mb_obs = b_obs[mb_inds].view(mb_inds.size, -1)  # Flatten the observation for each minibatch
                         _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, b_actions.long()[mb_inds])
-                    elif args.exp_type == "ppo_minatar":
+                    elif args.exp_type == "ppo_metaworld":
                         _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
 
                     logratio = newlogprob - b_logprobs[mb_inds]
