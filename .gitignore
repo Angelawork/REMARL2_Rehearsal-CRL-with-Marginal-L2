@@ -6,3 +6,4 @@ __pycache__/
 wandb/
 runs/
 metaw_venv/
+myenv/
