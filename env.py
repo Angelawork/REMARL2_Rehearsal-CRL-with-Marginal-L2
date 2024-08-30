@@ -12,7 +12,7 @@ import random
 from gym import ObservationWrapper
 
 class ResizeChannels(ObservationWrapper):
-    def __init__(self, env, target_channel=7):
+    def __init__(self, env, target_channel=10):
         super().__init__(env)
         self.target_channel = target_channel
         try:

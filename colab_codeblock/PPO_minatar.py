@@ -13,14 +13,6 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-class DummyWriter:
-    def add_scalar(self, *args, **kwargs):
-        pass
-    def add_text(self, *args, **kwargs):
-        pass
-    def close(self):
-        pass
-
 from stable_baselines3.common.atari_wrappers import (  # isort:skip
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -49,10 +41,8 @@ class Args:
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
-    enable_tensorboard: bool = False
-
     # Algorithm specific arguments
-    env_ids: list = ("MinAtar/Breakout-v0", "MinAtar/Asterix-v0", "MinAtar/Seaquest-v0")
+    env_ids: list = ("MinAtar/Breakout-v0", "MinAtar/Asterix-v0", "MinAtar/Freeway-v0")
     """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
@@ -131,17 +121,17 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     # args = tyro.cli(Args)
     args = Args(
-        exp_name="ppo",
+        exp_name="PPO_minatar",
         seed=1,
         torch_deterministic=True,
         cuda=True,
-        track=False,
+        track=True,
         capture_video=False,
         env_ids=["MinAtar/Breakout-v0","MinAtar/Asterix-v0", "MinAtar/Freeway-v0"],
-        total_timesteps=1000,
+        # total_timesteps=1000,
         learning_rate=2.5e-4,
-        num_envs=1,
-        num_steps=50,
+        # num_envs=2,
+        # num_steps=50,
     )
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -160,7 +150,7 @@ if __name__ == "__main__":
             save_code=True,
         )
     
-    writer = SummaryWriter(f"runs/{run_name}") if args.enable_tensorboard else DummyWriter()
+    writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -185,6 +175,8 @@ if __name__ == "__main__":
         assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
         tasks.append(envs)
     print(tasks)
+    global_step = 0
+    start_time = time.time()
     for i,envs in enumerate(tasks):
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
@@ -200,9 +192,6 @@ if __name__ == "__main__":
             values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
         # TRY NOT TO MODIFY: start the game
-        global_step = 0
-        start_time = time.time()
-
         next_obs, _ = envs.reset(seed=args.seed)
         next_obs = torch.Tensor(next_obs).to(device)
         next_done = torch.zeros(args.num_envs).to(device)

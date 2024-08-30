@@ -80,16 +80,27 @@ class Args:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO expr")
+    def parse_bool(x):
+        if isinstance(x, bool):
+            return x
+        if x.lower() in ('yes', 'true', 't', 'y'):
+            return True
+        elif x.lower() in ('no', 'false', 'f', 'n'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError(f'Bool value invalid:{x}')
     for field in fields(Args):
         arg_name = f"--{field.name.replace('_', '-')}"
         field_type = field.type
         default_value = field.default
         
-        if isinstance(default_value, list) or isinstance(default_value, tuple):
+        if field_type == bool:
+            parser.add_argument(arg_name, type=parse_bool, help=field.metadata.get("help", ""), default=default_value)
+        elif isinstance(default_value, list) or isinstance(default_value, tuple):
             field_type = str
             parser.add_argument(arg_name, nargs='+', help=field.metadata.get("help", ""), default=default_value)
         else:
-            parser.add_argument(arg_name, type=field_type, help=field.metadata.get("help", ""), default=default_value)
+            parser.add_argument(arg_name,nargs='?',type=field_type, help=field.metadata.get("help", ""), default=default_value)
     args = parser.parse_args()
     args_dict = vars(args)
     for field in fields(Args):
@@ -139,7 +150,7 @@ if __name__ == "__main__":
         print(f"expr type not supported:{args.exp_type}")
         exit(1)
 
-    if args.track and False:
+    if args.track:
         import wandb
 
         wandb.init(
