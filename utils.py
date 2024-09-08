@@ -8,8 +8,9 @@ def make_metaworld_env(env_ids, seed = 42):
     """
     # meta-world env setup:
     import metaworld
-    ml = metaworld.ML45(seed=seed)
-    print(f"Setting up Meta-World ML45 env: {env_ids}")
+    random.seed(seed)
+    ml = metaworld.ML10(seed=seed)
+    print(f"Setting up Meta-World ML45 env: {env_ids} with seed={seed}")
 
     training_envs = []
     testing_envs = []

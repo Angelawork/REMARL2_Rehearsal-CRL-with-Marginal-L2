@@ -42,8 +42,6 @@ class Args:
     """total timesteps of the experiments"""
     rolling_window: int = 100
     """ mean calculation's window size """
-    eval_interval: int = 50000  
-    """ Evaluate model performance every 50k steps"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     num_envs: int = 8
@@ -192,24 +190,23 @@ if __name__ == "__main__":
     print(f"Env tasks used in this run: {train_envs}")    
     for i,envs in enumerate(train_envs):
         print(f"Training on environment: {args.env_ids[i]}")
-        if i==0:
-            if args.exp_type == "ppo_minatar":
-                agent=PPO_minatar_Agent(envs=envs,seed=args.seed).to(device)
-            elif args.exp_type == "ppo_metaworld":
-                agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
+        if args.exp_type == "ppo_minatar":
+            agent=PPO_minatar_Agent(envs=envs,seed=args.seed).to(device)
+        elif args.exp_type == "ppo_metaworld":
+            agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
-            optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+        optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-            # ALGO Logic: Storage setup
-            obs_space_shape = envs.observation_space.shape if args.exp_type == "ppo_metaworld" else envs.single_observation_space.shape
-            act_space_shape = envs.action_space.shape if args.exp_type == "ppo_metaworld" else envs.single_action_space.shape
+        # ALGO Logic: Storage setup
+        obs_space_shape = envs.observation_space.shape if args.exp_type == "ppo_metaworld" else envs.single_observation_space.shape
+        act_space_shape = envs.action_space.shape if args.exp_type == "ppo_metaworld" else envs.single_action_space.shape
 
-            obs = torch.zeros((args.num_steps, args.num_envs) + obs_space_shape).to(device)
-            actions = torch.zeros((args.num_steps, args.num_envs) + act_space_shape).to(device)
-            logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-            rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-            dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-            values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        obs = torch.zeros((args.num_steps, args.num_envs) + obs_space_shape).to(device)
+        actions = torch.zeros((args.num_steps, args.num_envs) + act_space_shape).to(device)
+        logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
         # TRY NOT TO MODIFY: start the game
         next_obs, _ = envs.reset(seed=args.seed)
@@ -226,28 +223,6 @@ if __name__ == "__main__":
             reward_window = deque(maxlen=args.rolling_window) 
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
-                #env performance evaluation
-                if global_step % args.eval_interval == 0:
-                    print(f"Evaluating at global step {global_step}")
-                    for j, eval_env in enumerate(eval_envs):
-                        eval_obs, _ = eval_env.reset(seed=args.seed)
-                        eval_obs = torch.Tensor(eval_obs).to(device)
-                        eval_done = torch.zeros(args.num_envs).to(device)
-                        eval_rewards = []
-                        
-                        for eval_step in range(0, args.num_steps):
-                            with torch.no_grad():
-                                if args.exp_type == "ppo_minatar":
-                                    eval_obs = eval_obs.view(eval_obs.size(0), -1) 
-                                eval_action, _, _, _ = agent.get_action_and_value(eval_obs)
-                            eval_obs, eval_reward, eval_term, eval_trunc, _ = eval_env.step(eval_action.cpu().numpy())
-                            eval_done = np.logical_or(eval_term, eval_trunc)
-                            eval_rewards.append(torch.tensor(eval_reward).to(device).view(-1))
-
-                            eval_obs = torch.Tensor(eval_obs).to(device)
-                        avg_eval_reward = torch.stack(eval_rewards).mean().item()
-                        writer.add_scalar(f"eval/avg_rewards_{args.env_ids[j]}", avg_eval_reward, global_step)
-                        print(f"Finished evaluating env: {args.env_ids[j]} gives Avg reward = {avg_eval_reward}")
 
                 obs[step] = next_obs
                 if args.exp_type == "ppo_metaworld" and next_done.nelement() == 0:
@@ -259,6 +234,7 @@ if __name__ == "__main__":
                 # print(next_obs)
                 # print(next_obs.shape)
                 # next_obs = next_obs.view(next_obs.size(0), -1, 84, 84)
+
                 with torch.no_grad():
                     if args.exp_type == "ppo_minatar":
                         #flattened
@@ -268,6 +244,7 @@ if __name__ == "__main__":
                     values[step] = value.flatten()
                 actions[step] = action
                 logprobs[step] = logprob
+
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
                 # with open("experiment_log1.txt", "a") as file: file.write(f"Initial Observation: {next_obs}\n")
@@ -283,15 +260,15 @@ if __name__ == "__main__":
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
                 if args.exp_type == "ppo_metaworld":
-                    writer.add_scalar("charts/reward", reward, global_step)
-                    writer.add_scalar("charts/success", infos["success"], global_step)
+                    writer.add_scalar(f"charts/{args.env_ids[i]}_reward", reward, global_step)
+                    writer.add_scalar(f"charts/{args.env_ids[i]}_success", infos["success"], global_step)
                     succ_rate_window.append(infos["success"])
                     if len(succ_rate_window) == args.rolling_window:
                         writer.add_scalar(f"eval/rolling_success_rate", np.mean(succ_rate_window), global_step)
                     if "grasp_reward" in infos:
-                        writer.add_scalar("charts/grasp_reward", infos["grasp_reward"], global_step)
+                        writer.add_scalar(f"charts/{args.env_ids[i]}__grasp_reward", infos["grasp_reward"], global_step)
                     if "grasp_success" in infos:
-                        writer.add_scalar("charts/grasp_success", infos["grasp_success"], global_step)
+                        writer.add_scalar(f"charts/{args.env_ids[i]}__grasp_success", infos["grasp_success"], global_step)
 
                 if "final_info" in infos:
                     for info in infos["final_info"]:
@@ -300,9 +277,8 @@ if __name__ == "__main__":
                             reward_window.append(info['episode']['r'])
                             if len(reward_window) == args.rolling_window:
                                 writer.add_scalar(f"eval/rolling_episodic_return", np.mean(reward_window), global_step)
-                            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                        
+                            writer.add_scalar(f"charts/{args.env_ids[i]}__episodic_return", info["episode"]["r"], global_step)
+                            writer.add_scalar(f"charts/{args.env_ids[i]}__episodic_length", info["episode"]["l"], global_step)
 
             # bootstrap value if not done
             with torch.no_grad():
@@ -406,16 +382,16 @@ if __name__ == "__main__":
             explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
             # TRY NOT TO MODIFY: record rewards for plotting purposes
-            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-            writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-            writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-            writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-            writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-            writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-            writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-            writer.add_scalar("losses/explained_variance", explained_var, global_step)
+            writer.add_scalar(f"charts/{args.env_ids[i]}__learning_rate", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__value_loss", v_loss.item(), global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__policy_loss", pg_loss.item(), global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__entropy", entropy_loss.item(), global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__old_approx_kl", old_approx_kl.item(), global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__approx_kl", approx_kl.item(), global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__clipfrac", np.mean(clipfracs), global_step)
+            writer.add_scalar(f"losses/{args.env_ids[i]}__explained_variance", explained_var, global_step)
             print("SPS:", int(global_step / (time.time() - start_time)))
-            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+            writer.add_scalar(f"charts/{args.env_ids[i]}_SPS", int(global_step / (time.time() - start_time)), global_step)
 
             if args.exp_type == "ppo_metaworld":#take it as a done flag
                 if truncations:
