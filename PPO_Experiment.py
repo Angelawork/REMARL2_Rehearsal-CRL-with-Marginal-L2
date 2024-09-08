@@ -39,6 +39,8 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
+    eval_interval: int = 50000  
+    """ Evaluate model performance every 50k steps"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     num_envs: int = 8
@@ -136,15 +138,20 @@ if __name__ == "__main__":
     if args.exp_type == "ppo_metaworld":
         from utils import make_metaworld_env
         train_envs, test_envs = make_metaworld_env(args.env_ids, seed = args.seed)
+        eval_envs, _ = make_metaworld_env(args.env_ids, seed = args.seed)
     elif args.exp_type == "ppo_minatar":
         from env import make_minatar_env
-        tasks=[]
+        train_envs=[]
+        eval_envs=[]
         for env_id in args.env_ids:
             envs = gym.vector.SyncVectorEnv(
                 [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
             )
             assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-            tasks.append(envs)
+            train_envs.append(envs)
+            eval_envs.append(gym.vector.SyncVectorEnv(
+                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+            ))
         
     else:
         print(f"expr type not supported:{args.exp_type}")
@@ -179,17 +186,14 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
 
-    if args.exp_type == "ppo_metaworld":
-        tasks = train_envs
-
-    print(f"Env tasks used in this run: {tasks}")    
-    for i,envs in enumerate(tasks):
+    print(f"Env tasks used in this run: {train_envs}")    
+    for i,envs in enumerate(train_envs):
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
             if args.exp_type == "ppo_minatar":
-                agent=PPO_minatar_Agent(envs).to(device)
+                agent=PPO_minatar_Agent(envs=envs,seed=args.seed).to(device)
             elif args.exp_type == "ppo_metaworld":
-                agent = PPO_metaworld_Agent(envs).to(device)
+                agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
             optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
@@ -218,6 +222,30 @@ if __name__ == "__main__":
 
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
+
+                #env performance evaluation
+                if global_step % args.eval_interval == 0:
+                    print(f"Evaluating at global step {global_step}")
+                    for j, eval_env in enumerate(eval_envs):
+                        eval_obs, _ = eval_env.reset(seed=args.seed)
+                        eval_obs = torch.Tensor(eval_obs).to(device)
+                        eval_done = torch.zeros(args.num_envs).to(device)
+                        eval_rewards = []
+                        
+                        for eval_step in range(0, args.num_steps):
+                            with torch.no_grad():
+                                if args.exp_type == "ppo_minatar":
+                                    eval_obs = eval_obs.view(eval_obs.size(0), -1) 
+                                eval_action, _, _, _ = agent.get_action_and_value(eval_obs)
+                            eval_obs, eval_reward, eval_term, eval_trunc, _ = eval_env.step(eval_action.cpu().numpy())
+                            eval_done = np.logical_or(eval_term, eval_trunc)
+                            eval_rewards.append(torch.tensor(eval_reward).to(device).view(-1))
+
+                            eval_obs = torch.Tensor(eval_obs).to(device)
+                        avg_eval_reward = torch.stack(eval_rewards).mean().item()
+                        writer.add_scalar(f"eval/avg_rewards_{args.env_ids[j]}", avg_eval_reward, global_step)
+                        print(f"Finished evaluating env: {args.env_ids[j]} gives Avg reward = {avg_eval_reward}")
+
                 obs[step] = next_obs
                 if args.exp_type == "ppo_metaworld" and next_done.nelement() == 0:
                     # print("next_done invalid, reset as tensor([0.])")
@@ -241,13 +269,9 @@ if __name__ == "__main__":
 
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+                # with open("experiment_log1.txt", "a") as file: file.write(f"Initial Observation: {next_obs}\n")
+
                 if args.exp_type == "ppo_metaworld":
-                    if truncations:
-                        print("Truncated, env resetting!")
-                        next_obs, _ = envs.reset(seed=args.seed)
-                        next_obs = torch.Tensor(next_obs).to(device)
-                        next_done = torch.zeros(args.num_envs).to(device)
-                        continue
                     if step%100==0 and iteration%25==0:
                         print(f"\n*******************at step={step}, iteration={iteration} *******************\ninfos={infos}")
                         print(f"reward={reward}")
@@ -386,5 +410,11 @@ if __name__ == "__main__":
             print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+            if args.exp_type == "ppo_metaworld":#take it as a done flag
+                if truncations:
+                    print("Truncated, env resetting!")
+                    next_obs, _ = envs.reset(seed=args.seed)
+                    next_obs = torch.Tensor(next_obs).to(device)
+                    next_done = torch.zeros(args.num_envs).to(device)
         envs.close()
     writer.close()
