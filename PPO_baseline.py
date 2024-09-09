@@ -139,20 +139,15 @@ if __name__ == "__main__":
     if args.exp_type == "ppo_metaworld":
         from utils import make_metaworld_env
         train_envs, test_envs = make_metaworld_env(args.env_ids, seed = args.seed)
-        eval_envs, _ = make_metaworld_env(args.env_ids, seed = args.seed)
     elif args.exp_type == "ppo_minatar":
         from env import make_minatar_env
         train_envs=[]
-        eval_envs=[]
         for env_id in args.env_ids:
             envs = gym.vector.SyncVectorEnv(
-                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+                [make_minatar_env(env_id, i, args.capture_video, run_name,seed=args.seed) for i in range(args.num_envs)]
             )
             assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
             train_envs.append(envs)
-            eval_envs.append(gym.vector.SyncVectorEnv(
-                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
-            ))
         
     else:
         print(f"expr type not supported:{args.exp_type}")
@@ -258,13 +253,14 @@ if __name__ == "__main__":
                 next_done = np.logical_or(terminations, truncations)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
-
+                
+                scalar_reward = float(reward.flatten()[0]) if isinstance(reward, np.ndarray) else reward
+                writer.add_scalar(f"charts/{args.env_ids[i]}_reward", reward, global_step)
                 if args.exp_type == "ppo_metaworld":
-                    writer.add_scalar(f"charts/{args.env_ids[i]}_reward", reward, global_step)
                     writer.add_scalar(f"charts/{args.env_ids[i]}_success", infos["success"], global_step)
                     succ_rate_window.append(infos["success"])
                     if len(succ_rate_window) == args.rolling_window:
-                        writer.add_scalar(f"eval/rolling_success_rate", np.mean(succ_rate_window), global_step)
+                        writer.add_scalar(f"charts/{args.env_ids[i]}__rolling_success_rate", np.mean(succ_rate_window), global_step)
                     if "grasp_reward" in infos:
                         writer.add_scalar(f"charts/{args.env_ids[i]}__grasp_reward", infos["grasp_reward"], global_step)
                     if "grasp_success" in infos:
@@ -276,9 +272,15 @@ if __name__ == "__main__":
                             print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                             reward_window.append(info['episode']['r'])
                             if len(reward_window) == args.rolling_window:
-                                writer.add_scalar(f"eval/rolling_episodic_return", np.mean(reward_window), global_step)
+                                writer.add_scalar(f"charts/{args.env_ids[i]}__rolling_episodic_return", np.mean(reward_window), global_step)
                             writer.add_scalar(f"charts/{args.env_ids[i]}__episodic_return", info["episode"]["r"], global_step)
                             writer.add_scalar(f"charts/{args.env_ids[i]}__episodic_length", info["episode"]["l"], global_step)
+                if args.exp_type == "ppo_metaworld":#take it as a done flag
+                    if truncations:
+                        print("Truncated, env resetting!")
+                        next_obs, _ = envs.reset(seed=args.seed)
+                        next_obs = torch.Tensor(next_obs).to(device)
+                        next_done = torch.zeros(args.num_envs).to(device)
 
             # bootstrap value if not done
             with torch.no_grad():
@@ -392,12 +394,5 @@ if __name__ == "__main__":
             writer.add_scalar(f"losses/{args.env_ids[i]}__explained_variance", explained_var, global_step)
             print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar(f"charts/{args.env_ids[i]}_SPS", int(global_step / (time.time() - start_time)), global_step)
-
-            if args.exp_type == "ppo_metaworld":#take it as a done flag
-                if truncations:
-                    print("Truncated, env resetting!")
-                    next_obs, _ = envs.reset(seed=args.seed)
-                    next_obs = torch.Tensor(next_obs).to(device)
-                    next_done = torch.zeros(args.num_envs).to(device)
         envs.close()
     writer.close()
