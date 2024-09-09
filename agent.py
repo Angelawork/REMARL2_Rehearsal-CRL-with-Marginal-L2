@@ -37,11 +37,21 @@ class PPO_minatar_Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(hidden_size, envs.single_action_space.n), std=0.01),
         )
+        self.init_critic_params = self.get_flat_params(self.critic).detach()
+        self.init_actor_params = self.get_flat_params(self.actor).detach()
         set_seed(seed)
 
     def get_value(self, x):
         return self.critic(x)
 
+    def get_flat_params(self, module):
+        return torch.cat([p.flatten() for p in module.parameters()])
+    
+    def compute_l2_loss(self, device= torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+        curr_params = self.get_flat_params(self.critic)
+        l2_loss = 0.5 * ((curr_params.to(device) - self.init_critic_params.to(device)) ** 2).sum()#.mean()
+        return l2_loss
+    
     def get_action_and_value(self, x, action=None):
         logits = self.actor(x)
         probs = Categorical(logits=logits)
@@ -94,10 +104,29 @@ class PPO_metaworld_Agent(nn.Module):
             layer_init(nn.Linear(hidden_size, np.prod(envs.action_space.shape)), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.zeros(np.prod(envs.action_space.shape))) 
+ 
+        self.init_critic_params = self.get_flat_params(self.critic).detach()
+        self.init_actor_mean_params = self.get_flat_params(self.actor_mean).detach()
+        self.init_actor_logstd = self.actor_logstd.detach()
 
     def get_value(self, x):
         return self.critic(x)
 
+    def get_flat_params(self, module):
+        return torch.cat([p.flatten() for p in module.parameters()])
+    
+    def compute_l2_loss(self, device= torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+        curr_critic_params = self.get_flat_params(self.critic).to(device)
+        curr_actor_mean_params = self.get_flat_params(self.actor_mean).to(device)
+
+        l2_loss_critic = 0.5 * ((curr_critic_params - self.init_critic_params.to(device)) ** 2).sum()
+        l2_loss_actor_mean = 0.5 * ((curr_actor_mean_params - self.init_actor_mean_params.to(device)) ** 2).sum()
+        l2_loss_actor_logstd = 0.5 * ((self.actor_logstd.to(device) - self.init_actor_logstd.to(device)) ** 2).sum()
+
+        l2_loss = l2_loss_critic + l2_loss_actor_mean + l2_loss_actor_logstd
+        
+        return l2_loss
+    
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd

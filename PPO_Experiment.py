@@ -40,6 +40,10 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
+    use_l2_loss: bool = False
+    """Toggle for the usage of L2 init loss"""
+    l2_coef: float = 0.01
+    """ l2 init loss's coefficient"""
     rolling_window: int = 100
     """ mean calculation's window size """
     eval_interval: int = 50000  
@@ -141,19 +145,19 @@ if __name__ == "__main__":
     if args.exp_type == "ppo_metaworld":
         from utils import make_metaworld_env
         train_envs, test_envs = make_metaworld_env(args.env_ids, seed = args.seed)
-        eval_envs, _ = make_metaworld_env(args.env_ids, seed = args.seed)
+        eval_envs, _ = make_metaworld_env(args.env_ids, seed = args.seed+1)
     elif args.exp_type == "ppo_minatar":
         from env import make_minatar_env
         train_envs=[]
         eval_envs=[]
         for env_id in args.env_ids:
             envs = gym.vector.SyncVectorEnv(
-                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+                [make_minatar_env(env_id, i, args.capture_video, run_name,seed=args.seed) for i in range(args.num_envs)]
             )
             assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
             train_envs.append(envs)
             eval_envs.append(gym.vector.SyncVectorEnv(
-                [make_minatar_env(env_id, i, args.capture_video, run_name) for i in range(args.num_envs)]
+                [make_minatar_env(env_id, i, args.capture_video, run_name,seed=args.seed+1) for i in range(args.num_envs)]
             ))
         
     else:
@@ -230,7 +234,7 @@ if __name__ == "__main__":
                 if global_step % args.eval_interval == 0:
                     print(f"Evaluating at global step {global_step}")
                     for j, eval_env in enumerate(eval_envs):
-                        eval_obs, _ = eval_env.reset(seed=args.seed)
+                        eval_obs, _ = eval_env.reset(seed=args.seed+1)
                         eval_obs = torch.Tensor(eval_obs).to(device)
                         eval_done = torch.zeros(args.num_envs).to(device)
                         eval_rewards = []
@@ -240,13 +244,17 @@ if __name__ == "__main__":
                                 if args.exp_type == "ppo_minatar":
                                     eval_obs = eval_obs.view(eval_obs.size(0), -1) 
                                 eval_action, _, _, _ = agent.get_action_and_value(eval_obs)
-                            eval_obs, eval_reward, eval_term, eval_trunc, _ = eval_env.step(eval_action.cpu().numpy())
+                            eval_obs, eval_reward, eval_term, eval_trunc, eval_infos = eval_env.step(eval_action.cpu().numpy())
                             eval_done = np.logical_or(eval_term, eval_trunc)
                             eval_rewards.append(torch.tensor(eval_reward).to(device).view(-1))
 
                             eval_obs = torch.Tensor(eval_obs).to(device)
                         avg_eval_reward = torch.stack(eval_rewards).mean().item()
                         writer.add_scalar(f"eval/avg_rewards_{args.env_ids[j]}", avg_eval_reward, global_step)
+                        if "final_info" in eval_infos:
+                            for info in eval_infos["final_info"]:
+                                if info and "episode" in info:
+                                    writer.add_scalar(f"eval/{args.env_ids[j]}__episodic_return", info["episode"]["r"], global_step)
                         print(f"Finished evaluating env: {args.env_ids[j]} gives Avg reward = {avg_eval_reward}")
 
                 obs[step] = next_obs
@@ -270,7 +278,8 @@ if __name__ == "__main__":
                 logprobs[step] = logprob
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-                # with open("experiment_log1.txt", "a") as file: file.write(f"Initial Observation: {next_obs}\n")
+                # with open("experiment_log1.txt", "a") as file: 
+                    # file.write(f"Observation: {next_obs}\nreward:{reward} infos:{infos} terminations:{terminations} truncations:{truncations}")
                 # if args.exp_type == "ppo_metaworld":
                 #     if step%100==0 and iteration%25==0:
                 #         print(f"\n*******************at step={step}, iteration={iteration} *******************\ninfos={infos}")
@@ -282,12 +291,13 @@ if __name__ == "__main__":
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
+                scalar_reward = float(reward.flatten()[0]) if isinstance(reward, np.ndarray) else reward
+                writer.add_scalar("charts/reward", scalar_reward, global_step)
                 if args.exp_type == "ppo_metaworld":
-                    writer.add_scalar("charts/reward", reward, global_step)
                     writer.add_scalar("charts/success", infos["success"], global_step)
                     succ_rate_window.append(infos["success"])
                     if len(succ_rate_window) == args.rolling_window:
-                        writer.add_scalar(f"eval/rolling_success_rate", np.mean(succ_rate_window), global_step)
+                        writer.add_scalar(f"charts/rolling_success_rate", np.mean(succ_rate_window), global_step)
                     if "grasp_reward" in infos:
                         writer.add_scalar("charts/grasp_reward", infos["grasp_reward"], global_step)
                     if "grasp_success" in infos:
@@ -299,10 +309,15 @@ if __name__ == "__main__":
                             print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                             reward_window.append(info['episode']['r'])
                             if len(reward_window) == args.rolling_window:
-                                writer.add_scalar(f"eval/rolling_episodic_return", np.mean(reward_window), global_step)
+                                writer.add_scalar(f"charts/rolling_episodic_return", np.mean(reward_window), global_step)
                             writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                             writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                        
+                if args.exp_type == "ppo_metaworld":#take it as a done flag
+                    if truncations:
+                        print("Truncated, env resetting!")
+                        next_obs, _ = envs.reset(seed=args.seed)
+                        next_obs = torch.Tensor(next_obs).to(device)
+                        next_done = torch.zeros(args.num_envs).to(device)
 
             # bootstrap value if not done
             with torch.no_grad():
@@ -392,6 +407,9 @@ if __name__ == "__main__":
                     # print(f"pg_loss: {pg_loss}, v_loss: {v_loss}, entropy_loss: {entropy_loss}")
                     # print(f"old_approx_kl: {old_approx_kl}, approx_kl: {approx_kl}")
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                    if args.use_l2_loss:
+                        l2_loss = agent.compute_l2_loss(device=device)
+                        loss += args.l2_coef * l2_loss
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -416,12 +434,5 @@ if __name__ == "__main__":
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
             print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-            if args.exp_type == "ppo_metaworld":#take it as a done flag
-                if truncations:
-                    print("Truncated, env resetting!")
-                    next_obs, _ = envs.reset(seed=args.seed)
-                    next_obs = torch.Tensor(next_obs).to(device)
-                    next_done = torch.zeros(args.num_envs).to(device)
         envs.close()
     writer.close()

@@ -11,6 +11,14 @@ import torch
 import random
 from gym import ObservationWrapper
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 class ResizeChannels(ObservationWrapper):
     def __init__(self, env, target_channel=10):
         super().__init__(env)
@@ -78,7 +86,7 @@ class BoolToUint8(ObservationWrapper):
       else:
         return data
 
-def make_minatar_env(env_id, idx, capture_video, run_name, obs_size = (10,10)):
+def make_minatar_env(env_id, idx, capture_video, run_name, seed=42,obs_size = (10,10)):
     """ available usage: 
     env_id from ["MinAtar/Asterix-v0", "MinAtar/Breakout-v0", "MinAtar/Freeway-v0", "MinAtar/Seaquest-v0", "MinAtar/SpaceInvaders-v0", "MinAtar/Asterix-v1", "MinAtar/Breakout-v1", "MinAtar/Freeway-v1", "MinAtar/Seaquest-v1", "MinAtar/SpaceInvaders-v1"]
     """
@@ -94,7 +102,10 @@ def make_minatar_env(env_id, idx, capture_video, run_name, obs_size = (10,10)):
         # from minatar import Environment
         # ["asterix", "breakout", "freeway", "seaquest", "space_invaders", "asterix"]
         # env = Environment(env_id)
-
+        env.seed(seed)
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+        set_seed(seed)
         # wrappers
         env = gym.wrappers.RecordEpisodeStatistics(env)
         # env = MaxAndSkipEnv(env, skip=4)
