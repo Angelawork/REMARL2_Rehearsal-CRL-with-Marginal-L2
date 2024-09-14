@@ -20,7 +20,8 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class ResizeChannels(ObservationWrapper):
-    def __init__(self, env, target_channel=10):
+    def __init__(self, env, target_channel=10, seed=42):
+        set_seed(seed)
         super().__init__(env)
         self.target_channel = target_channel
         try:
@@ -58,7 +59,8 @@ class ResizeChannels(ObservationWrapper):
         return data
 
 class BoolToUint8(ObservationWrapper):
-    def __init__(self, env):
+    def __init__(self, env, seed=42):
+        set_seed(seed)
         super().__init__(env)
         try:
             self.observation_space = gym.spaces.Box(
@@ -111,10 +113,10 @@ def make_minatar_env(env_id, idx, capture_video, run_name, seed=42,obs_size = (1
         # env = MaxAndSkipEnv(env, skip=4)
         # env = EpisodicLifeEnv(env)
         # env = ClipRewardEnv(env)
-        env = BoolToUint8(env)
-        env = ResizeChannels(env)
+        env = BoolToUint8(env, seed=seed)
+        env = ResizeChannels(env, seed=seed)
         env = gym.wrappers.ResizeObservation(env, obs_size)
-        env = gym.wrappers.FrameStack(env, 4)
+        # env = gym.wrappers.FrameStack(env, 4)
         return env
 
     return thunk
