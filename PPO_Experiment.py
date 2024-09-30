@@ -12,8 +12,86 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from agent import PPO_minatar_Agent, PPO_metaworld_Agent
+from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent
 
+def evaluate_single_env(agent, env, eval_episodes, device, max_steps=10000):
+    agent.eval()
+    total_rewards = []
+    steps_per_episode = []
+
+    for j in range(eval_episodes):
+        obs, _ = env.reset(seed=args.seed + j)
+        obs = torch.tensor(obs, dtype=torch.float32).to(device)
+        
+        done = False
+        episode_reward = 0
+        steps = 0
+
+        while steps < max_steps and not done:
+            with torch.no_grad():
+                action, _, _, _ = agent.get_action_and_value(obs)
+                action = action.cpu().numpy()
+                
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                episode_reward += reward
+                obs = torch.tensor(next_obs, dtype=torch.float32).to(device)
+                
+                steps += 1
+
+        total_rewards.append(episode_reward)
+        steps_per_episode.append(steps)
+
+    total_rewards = [r / eval_episodes for r in total_rewards]
+    mean_reward = np.mean(total_rewards) if total_rewards else 0.0
+    mean_steps = np.mean(steps_per_episode) if steps_per_episode else 0.0
+    
+    print(f"Total rewards over {eval_episodes} episodes: {total_rewards}")
+    print(f"Steps per episode: {steps_per_episode}")
+    
+    return mean_reward, mean_steps
+
+def evaluate_parallel_env(agent, envs, eval_episodes, device, max_steps=1000):
+    agent.eval()
+    total_rewards = []
+    steps_per_episode = []
+
+    for j in range(eval_episodes):
+        obs, _ = envs.reset(seed=args.seed+j)
+        obs = torch.tensor(obs, dtype=torch.float32).to(device)
+        
+        done = np.zeros(envs.num_envs, dtype=bool) 
+        episode_rewards = np.zeros(envs.num_envs)   
+        steps = 0
+
+        while steps < max_steps and not np.all(done):
+            with torch.no_grad():
+                action, _, _, _ = agent.get_action_and_value(obs)
+                action = action.cpu().numpy()
+                
+                next_obs, reward, terminations, truncations, _ = envs.step(action)
+                done = np.logical_or(done, np.logical_or(terminations, truncations))
+
+                reward = np.where(~done, reward, 0)
+                episode_rewards += reward
+                obs = torch.tensor(next_obs, dtype=torch.float32).to(device)
+                steps += 1
+
+                if np.all(done):
+                    break
+
+        total_rewards.append(np.mean(episode_rewards))  # avg reward per episode (across envs)
+        steps_per_episode.append(steps) 
+
+    total_rewards = [r / eval_episodes for r in total_rewards]
+    mean_reward = np.mean(total_rewards) if total_rewards else 0.0
+    mean_steps = np.mean(steps_per_episode) if steps_per_episode else 0.0
+    
+    # print(f"total_rewards over {eval_episodes} episodes: {total_rewards}")
+    # print(f"steps_per_episode per episode: {steps_per_episode}")
+    
+    return mean_reward, mean_steps
 
 @dataclass
 class Args:
@@ -143,9 +221,9 @@ if __name__ == "__main__":
 
     # Environment setup
     if args.exp_type == "ppo_metaworld":
-        from utils import make_metaworld_env
-        train_envs, test_envs = make_metaworld_env(args.env_ids, seed = args.seed)
-        eval_envs, _ = make_metaworld_env(args.env_ids, seed = args.seed+1)
+        from utils import make_metaworld_env, make_tianshou_metaworld_env
+        train_envs, test_envs = make_tianshou_metaworld_env(args.env_ids, seed = args.seed, training_num=args.num_envs)
+        eval_envs, _ = make_tianshou_metaworld_env(args.env_ids, seed = args.seed+1, training_num=args.num_envs)
     elif args.exp_type == "ppo_minatar":
         from env import make_minatar_env
         train_envs=[]
@@ -198,7 +276,7 @@ if __name__ == "__main__":
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
             if args.exp_type == "ppo_minatar":
-                agent=PPO_minatar_Agent(envs=envs,seed=args.seed).to(device)
+                agent=PPO_Conv_Agent(envs=envs,seed=args.seed).to(device)
             elif args.exp_type == "ppo_metaworld":
                 agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
@@ -219,6 +297,9 @@ if __name__ == "__main__":
         next_obs, _ = envs.reset(seed=args.seed)
         next_obs = torch.Tensor(next_obs).to(device)
         next_done = torch.zeros(args.num_envs).to(device)
+        episode_success_rates=[]
+        episode_rewards = []
+        reward_window=[]
 
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
@@ -226,51 +307,16 @@ if __name__ == "__main__":
                 frac = 1.0 - (iteration - 1.0) / args.num_iterations
                 lrnow = frac * args.learning_rate
                 optimizer.param_groups[0]["lr"] = lrnow
-            succ_rate_window = deque(maxlen=args.rolling_window) 
-            reward_window = deque(maxlen=args.rolling_window) 
+            
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
-                #env performance evaluation
-                if global_step % args.eval_interval == 0:
-                    print(f"Evaluating at global step {global_step}")
-                    for j, eval_env in enumerate(eval_envs):
-                        eval_obs, _ = eval_env.reset(seed=args.seed+1)
-                        eval_obs = torch.Tensor(eval_obs).to(device)
-                        eval_done = torch.zeros(args.num_envs).to(device)
-                        eval_rewards = []
-                        
-                        for eval_step in range(0, args.num_steps):
-                            with torch.no_grad():
-                                if args.exp_type == "ppo_minatar":
-                                    eval_obs = eval_obs.view(eval_obs.size(0), -1) 
-                                eval_action, _, _, _ = agent.get_action_and_value(eval_obs)
-                            eval_obs, eval_reward, eval_term, eval_trunc, eval_infos = eval_env.step(eval_action.cpu().numpy())
-                            eval_done = np.logical_or(eval_term, eval_trunc)
-                            eval_rewards.append(torch.tensor(eval_reward).to(device).view(-1))
-
-                            eval_obs = torch.Tensor(eval_obs).to(device)
-                        avg_eval_reward = torch.stack(eval_rewards).mean().item()
-                        writer.add_scalar(f"eval/avg_rewards_{args.env_ids[j]}", avg_eval_reward, global_step)
-                        if "final_info" in eval_infos:
-                            for info in eval_infos["final_info"]:
-                                if info and "episode" in info:
-                                    writer.add_scalar(f"eval/{args.env_ids[j]}__episodic_return", info["episode"]["r"], global_step)
-                        print(f"Finished evaluating env: {args.env_ids[j]} gives Avg reward = {avg_eval_reward}")
 
                 obs[step] = next_obs
                 if args.exp_type == "ppo_metaworld" and next_done.nelement() == 0:
                     # print("next_done invalid, reset as tensor([0.])")
                     next_done = torch.zeros(args.num_envs).to(device)
                 dones[step] = next_done
-
-                # ALGO LOGIC: action logic
-                # print(next_obs)
-                # print(next_obs.shape)
-                # next_obs = next_obs.view(next_obs.size(0), -1, 84, 84)
                 with torch.no_grad():
-                    if args.exp_type == "ppo_minatar":
-                        #flattened
-                        next_obs = next_obs.view(next_obs.size(0), -1)
                     action, logprob, _, value = agent.get_action_and_value(next_obs)
 
                     values[step] = value.flatten()
@@ -278,55 +324,55 @@ if __name__ == "__main__":
                 logprobs[step] = logprob
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
-                # with open("experiment_log1.txt", "a") as file: 
-                    # file.write(f"Observation: {next_obs}\nreward:{reward} infos:{infos} terminations:{terminations} truncations:{truncations}")
-                # if args.exp_type == "ppo_metaworld":
-                #     if step%100==0 and iteration%25==0:
-                #         print(f"\n*******************at step={step}, iteration={iteration} *******************\ninfos={infos}")
-                #         print(f"reward={reward}")
-                #         print(f"terminations={terminations}")
-                #         print(f"truncations={truncations}")
 
                 next_done = np.logical_or(terminations, truncations)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-                scalar_reward = float(reward.flatten()[0]) if isinstance(reward, np.ndarray) else reward
-                writer.add_scalar("charts/reward", scalar_reward, global_step)
+                episode_rewards.append(torch.tensor(reward).to(device).view(-1))
                 if args.exp_type == "ppo_metaworld":
-                    writer.add_scalar("charts/success", infos["success"], global_step)
-                    succ_rate_window.append(infos["success"])
-                    if len(succ_rate_window) == args.rolling_window:
-                        writer.add_scalar(f"charts/rolling_success_rate", np.mean(succ_rate_window), global_step)
-                    if "grasp_reward" in infos:
-                        writer.add_scalar("charts/grasp_reward", infos["grasp_reward"], global_step)
-                    if "grasp_success" in infos:
-                        writer.add_scalar("charts/grasp_success", infos["grasp_success"], global_step)
-
+                    episode_success_rates.append(infos["success"])
+                    writer.add_scalar(f"charts/{args.env_ids[i]}_reward", reward, global_step)
+                    writer.add_scalar(f"charts/{args.env_ids[i]}_success", infos["success"], global_step)
+                    if global_step % 50000 == 0: #np.any(np.logical_or(terminations, truncations)):
+                        if len(episode_success_rates) > 0:
+                            success_rate_mean = np.mean(episode_success_rates)
+                            writer.add_scalar(f"eval/success_rate_mean", success_rate_mean, global_step)
+                            episode_success_rates = []
+                        
+                        if len(episode_rewards) > 0:
+                            mean_reward = torch.stack(episode_rewards).mean().item()
+                            writer.add_scalar(f"eval/mean_reward", mean_reward, global_step)
+                            episode_rewards = []
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                             reward_window.append(info['episode']['r'])
-                            if len(reward_window) == args.rolling_window:
-                                writer.add_scalar(f"charts/rolling_episodic_return", np.mean(reward_window), global_step)
-                            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                            if len(reward_window) > args.rolling_window:
+                                reward_window.pop(0)
+
+                            if global_step<=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0):
+                                writer.add_scalar(f"train/rolling_episodic_return", np.mean(reward_window), global_step)
+
+                            writer.add_scalar(f"train/episodic_return", info["episode"]["r"], global_step)
+                            writer.add_scalar(f"train/episodic_length", info["episode"]["l"], global_step)
                 if args.exp_type == "ppo_metaworld":#take it as a done flag
                     if truncations:
                         print("Truncated, env resetting!")
                         next_obs, _ = envs.reset(seed=args.seed)
                         next_obs = torch.Tensor(next_obs).to(device)
                         next_done = torch.zeros(args.num_envs).to(device)
+                
+                if global_step!=0 and global_step % args.eval_interval == 0:
+                    print("Evaluating model performance!")
+                    for j, eval_env in enumerate(eval_envs):
+                        mean_reward, mean_steps = evaluate_parallel_env(agent, eval_env, 1, device)
+                        writer.add_scalar(f"test/{args.env_ids[j]}__eval_R", mean_reward, global_step)
+                        writer.add_scalar(f"test/{args.env_ids[j]}__eval_steps", mean_steps, global_step)
 
             # bootstrap value if not done
             with torch.no_grad():
-                if args.exp_type == "ppo_metaworld":
-                    next_value = agent.get_value(next_obs).reshape(1, -1)
-                elif args.exp_type == "ppo_minatar":
-                    next_obs_flattened = next_obs.reshape(-1, np.array(envs.single_observation_space.shape).prod())
-                    next_value = agent.get_value(next_obs_flattened).reshape(1, -1)
-
+                next_value = agent.get_value(next_obs).reshape(1, -1)
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
@@ -362,13 +408,7 @@ if __name__ == "__main__":
                 for start in range(0, args.batch_size, args.minibatch_size):
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
-
-                    if args.exp_type == "ppo_minatar":
-                        # Reshape b_obs correctly for the actor network
-                        mb_obs = b_obs[mb_inds].view(mb_inds.size, -1)  # Flatten the observation for each minibatch
-                        _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, b_actions.long()[mb_inds])
-                    elif args.exp_type == "ppo_metaworld":
-                        _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
 
                     logratio = newlogprob - b_logprobs[mb_inds]
                     ratio = logratio.exp()
@@ -404,12 +444,12 @@ if __name__ == "__main__":
                         v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                     entropy_loss = entropy.mean()
-                    # print(f"pg_loss: {pg_loss}, v_loss: {v_loss}, entropy_loss: {entropy_loss}")
-                    # print(f"old_approx_kl: {old_approx_kl}, approx_kl: {approx_kl}")
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
                     if args.use_l2_loss:
                         l2_loss = agent.compute_l2_loss(device=device)
                         loss += args.l2_coef * l2_loss
+                        writer.add_scalar(f"train/{args.env_ids[i]}__l2_loss", l2_loss, global_step)
+                    writer.add_scalar(f"train/{args.env_ids[i]}__loss", loss, global_step)
 
                     optimizer.zero_grad()
                     loss.backward()

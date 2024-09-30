@@ -14,7 +14,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent
 
-def evaluate_single_env(agent, env, eval_episodes, device, max_steps=5000):
+def evaluate_single_env(agent, env, eval_episodes, device, max_steps=10000):
     agent.eval()
     total_rewards = []
     steps_per_episode = []
@@ -65,35 +65,31 @@ def evaluate_parallel_env(agent, envs, eval_episodes, device, max_steps=1000):
         episode_rewards = np.zeros(envs.num_envs)   
         steps = 0
 
-        while steps < max_steps:
+        while steps < max_steps and not np.all(done):
             with torch.no_grad():
                 action, _, _, _ = agent.get_action_and_value(obs)
                 action = action.cpu().numpy()
                 
                 next_obs, reward, terminations, truncations, _ = envs.step(action)
-                done = np.logical_or(terminations, truncations)
+                done = np.logical_or(done, np.logical_or(terminations, truncations))
 
-                episode_rewards += reward  
+                reward = np.where(~done, reward, 0)
+                episode_rewards += reward
                 obs = torch.tensor(next_obs, dtype=torch.float32).to(device)
                 steps += 1
 
                 if np.all(done):
                     break
 
-        for i in range(envs.num_envs):
-            if not done[i]:  
-                total_rewards.append(episode_rewards[i])
-            else: 
-                total_rewards.append(episode_rewards[i])
-
-        steps_per_episode.append(steps)
+        total_rewards.append(np.mean(episode_rewards))  # avg reward per episode (across envs)
+        steps_per_episode.append(steps) 
 
     total_rewards = [r / eval_episodes for r in total_rewards]
     mean_reward = np.mean(total_rewards) if total_rewards else 0.0
     mean_steps = np.mean(steps_per_episode) if steps_per_episode else 0.0
     
-    print(f"total_rewards over {eval_episodes} episodes: {total_rewards}")
-    print(f"steps_per_episode per episode: {steps_per_episode}")
+    # print(f"total_rewards over {eval_episodes} episodes: {total_rewards}")
+    # print(f"steps_per_episode per episode: {steps_per_episode}")
     
     return mean_reward, mean_steps
     
@@ -200,19 +196,6 @@ if __name__ == "__main__":
     # args = tyro.cli(Args)
     args = parse_args()
     print(f"Args used for this expr: {args}")
-    # example: args = Args(
-    #     exp_name="PPO_minatar",
-    #     seed=1,
-    #     torch_deterministic=True,
-    #     cuda=True,
-    #     track=True,
-    #     capture_video=False,
-    #     env_ids=["MinAtar/Breakout-v0","MinAtar/Asterix-v0", "MinAtar/Freeway-v0"],
-    #     # total_timesteps=1000,
-    #     learning_rate=2.5e-4,
-    #     # num_envs=2,
-    #     # num_steps=50,
-    # )
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -235,7 +218,7 @@ if __name__ == "__main__":
             assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
             train_envs.append(envs)
             eval_envs.append(gym.vector.SyncVectorEnv(
-                [make_minatar_env(env_id, i, args.capture_video, run_name,seed=args.seed+1) for i in range(1)]
+                [make_minatar_env(env_id, i, args.capture_video, run_name,seed=args.seed+1) for i in range(args.num_envs)]
             ))
         
     else:
@@ -252,7 +235,7 @@ if __name__ == "__main__":
             config=vars(args),
             name=run_name,
             monitor_gym=True,
-            save_code=False,
+            save_code=True,
         )
     
     writer = SummaryWriter(f"runs/{run_name}")
@@ -298,6 +281,7 @@ if __name__ == "__main__":
         next_done = torch.zeros(args.num_envs).to(device)
         episode_success_rates=[]
         episode_rewards = []
+        reward_window=[]
         
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
@@ -315,9 +299,6 @@ if __name__ == "__main__":
                     next_done = torch.zeros(args.num_envs).to(device)
                 dones[step] = next_done
                 with torch.no_grad():
-                    # if args.exp_type == "ppo_minatar":
-                    #     #flattened
-                    #     next_obs = next_obs.view(next_obs.size(0), -1)
                     action, logprob, _, value = agent.get_action_and_value(next_obs)
 
                     values[step] = value.flatten()
@@ -350,12 +331,15 @@ if __name__ == "__main__":
                 if "final_info" in infos:
                     for info in infos["final_info"]:
                         if info and "episode" in info:
-                            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                            # reward_window.append(info['episode']['r'])
-                            # if len(reward_window) == args.rolling_window:
-                            #     writer.add_scalar(f"charts/{args.env_ids[i]}__rolling_episodic_return", np.mean(reward_window), global_step)
-                            writer.add_scalar(f"{args.env_ids[i]}/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar(f"{args.env_ids[i]}/episodic_length", info["episode"]["l"], global_step)
+                            reward_window.append(info['episode']['r'])
+                            if len(reward_window) > args.rolling_window:
+                                reward_window.pop(0)
+
+                            if global_step<=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0):
+                                writer.add_scalar(f"train/{args.env_ids[i]}__rolling_episodic_return", np.mean(reward_window), global_step)
+
+                            writer.add_scalar(f"train/{args.env_ids[i]}/episodic_return", info["episode"]["r"], global_step)
+                            writer.add_scalar(f"train/{args.env_ids[i]}/episodic_length", info["episode"]["l"], global_step)
                 if args.exp_type == "ppo_metaworld":#take it as a done flag
                     if truncations:
                         print("Truncated, env resetting!")
@@ -365,18 +349,13 @@ if __name__ == "__main__":
                 
                 if global_step!=0 and global_step % args.eval_interval == 0:
                     print("Evaluating model performance!")
-                    mean_reward, mean_steps = evaluate_single_env(agent, eval_envs[i], 1, device)
+                    mean_reward, mean_steps = evaluate_parallel_env(agent, eval_envs[i], 1, device)
                     writer.add_scalar(f"test/{args.env_ids[i]}__eval_R", mean_reward, global_step)
                     writer.add_scalar(f"test/{args.env_ids[i]}__eval_steps", mean_steps, global_step)
 
             # bootstrap value if not done
             with torch.no_grad():
-                # if args.exp_type == "ppo_metaworld":
                 next_value = agent.get_value(next_obs).reshape(1, -1)
-                # elif args.exp_type == "ppo_minatar":
-                #     next_obs_flattened = next_obs.reshape(-1, np.array(envs.single_observation_space.shape).prod())
-                #     next_value = agent.get_value(next_obs_flattened).reshape(1, -1)
-
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
@@ -412,12 +391,6 @@ if __name__ == "__main__":
                 for start in range(0, args.batch_size, args.minibatch_size):
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
-
-                    # if args.exp_type == "ppo_minatar":
-                    #     # Reshape b_obs correctly for the actor network
-                    #     mb_obs = b_obs[mb_inds].view(mb_inds.size, -1)  # Flatten the observation for each minibatch
-                    #     _, newlogprob, entropy, newvalue = agent.get_action_and_value(mb_obs, b_actions.long()[mb_inds])
-                    # elif args.exp_type == "ppo_metaworld":
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
 
                     logratio = newlogprob - b_logprobs[mb_inds]
@@ -454,8 +427,6 @@ if __name__ == "__main__":
                         v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                     entropy_loss = entropy.mean()
-                    # print(f"pg_loss: {pg_loss}, v_loss: {v_loss}, entropy_loss: {entropy_loss}")
-                    # print(f"old_approx_kl: {old_approx_kl}, approx_kl: {approx_kl}")
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                     optimizer.zero_grad()

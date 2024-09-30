@@ -85,7 +85,7 @@ class RandomAgent(nn.Module):
 class PPO_metaworld_Agent(nn.Module):
     def __init__(self, envs, seed=None,hidden_size=256):
         set_seed(seed)
-        envs.seed(seed)
+        envs.unwrapped.seed(seed)
         envs.action_space.seed(seed)
         envs.observation_space.seed(seed)
 
