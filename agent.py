@@ -44,6 +44,10 @@ class PPO_minatar_Agent(nn.Module):
 
     def get_value(self, x):
         return self.critic(x)
+    
+    def set_flat_params(self):
+        self.init_critic_params = self.get_flat_params(self.critic).detach()
+        self.init_actor_params = self.get_flat_params(self.actor).detach()
 
     def get_flat_params(self, module):
         return torch.cat([p.flatten() for p in module.parameters()])
@@ -112,6 +116,10 @@ class PPO_metaworld_Agent(nn.Module):
 
     def get_value(self, x):
         return self.critic(x)
+        
+    def set_flat_params(self):
+        self.init_critic_params = self.get_flat_params(self.critic).detach()
+        self.init_actor_params = self.get_flat_params(self.actor).detach()
 
     def get_flat_params(self, module):
         return torch.cat([p.flatten() for p in module.parameters()])
@@ -169,6 +177,10 @@ class PPO_Conv_Agent(nn.Module):
         self.critic_fc2 = nn.Linear(hidden_size, hidden_size)
         self.critic_out = nn.Linear(hidden_size, 1)
 
+        self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
+        self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        
+    def set_flat_params(self):
         self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
         self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
 
