@@ -13,6 +13,32 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent
+from pathlib import Path
+
+class RUNNINGSTATISTICS:
+    def __init__(self):
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def add(self, x):
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / self.count
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+
+    def variance(self):
+        return self.m2 / (self.count)
+
+    def float_std(self):
+        return self.variance() ** 0.5
+    
+    def standard_deviation(self):
+        return torch.tensor(self.variance() ** 0.5).to(device)
+
+    def get_mean(self):
+        return self.mean
 
 def evaluate_single_env(agent, env, eval_episodes, device, max_steps=10000):
     agent.eval()
@@ -34,8 +60,12 @@ def evaluate_single_env(agent, env, eval_episodes, device, max_steps=10000):
                 
                 next_obs, reward, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
-                
+
                 episode_reward += reward
+                # reward_tensor = torch.tensor(reward).to(device).view(-1)
+                # scaled_reward = reward_tensor / (reward_statistics.standard_deviation() + 1e-8)
+
+                # episode_reward += scaled_reward
                 obs = torch.tensor(next_obs, dtype=torch.float32).to(device)
                 
                 steps += 1
@@ -122,6 +152,8 @@ class Args:
     """Toggle for the usage of L2 init loss"""
     l2_coef: float = 0.01
     """ l2 init loss's coefficient"""
+    periodic_l2: bool = False
+    """Toggle for the usage of L2 init loss on every parameter: theta_t-1 instead of paramater at theta_0"""
     rolling_window: int = 100
     """ mean calculation's window size """
     eval_interval: int = 50000  
@@ -252,7 +284,8 @@ if __name__ == "__main__":
             config=vars(args),
             name=run_name,
             monitor_gym=True,
-            save_code=True,
+            save_code=False,
+            settings=wandb.Settings(console="off",log_internal=str(Path(__file__).parent / 'wandb' / 'null')),
         )
     
     writer = SummaryWriter(f"runs/{run_name}")
@@ -292,6 +325,9 @@ if __name__ == "__main__":
             rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
             dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
             values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+        else:
+            if args.periodic_l2:
+                agent.set_flat_params()
 
         # TRY NOT TO MODIFY: start the game
         next_obs, _ = envs.reset(seed=args.seed)
@@ -301,6 +337,8 @@ if __name__ == "__main__":
         episode_rewards = []
         reward_window=[]
 
+        reward_statistics = RUNNINGSTATISTICS()
+
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
             if args.anneal_lr:
@@ -308,6 +346,7 @@ if __name__ == "__main__":
                 lrnow = frac * args.learning_rate
                 optimizer.param_groups[0]["lr"] = lrnow
             
+            R_t_1 = 0.0
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
 
@@ -324,9 +363,17 @@ if __name__ == "__main__":
                 logprobs[step] = logprob
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+                
+                reward_tensor = torch.tensor(reward).to(device).view(-1)
+                R_t = args.gamma * R_t_1 + reward
+                reward_statistics.add(R_t)
+                R_t_1 = R_t
+                scaled_reward = reward_tensor / (reward_statistics.standard_deviation() + 1e-8)
+
+                rewards[step] = scaled_reward
+                #rewards[step] = torch.tensor(reward).to(device).view(-1)
 
                 next_done = np.logical_or(terminations, truncations)
-                rewards[step] = torch.tensor(reward).to(device).view(-1)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
                 episode_rewards.append(torch.tensor(reward).to(device).view(-1))
@@ -344,18 +391,31 @@ if __name__ == "__main__":
                             mean_reward = torch.stack(episode_rewards).mean().item()
                             writer.add_scalar(f"eval/mean_reward", mean_reward, global_step)
                             episode_rewards = []
+                            
+                writer.add_scalar(f"train/reward_mean", reward_statistics.get_mean().mean(), global_step)
+                writer.add_scalar(f"train/reward_std", reward_statistics.float_std().mean(), global_step)
+
                 if "final_info" in infos:
-                    for info in infos["final_info"]:
+                    print(reward_statistics.float_std())
+                    for k, info in enumerate(infos["final_info"]):
                         if info and "episode" in info:
-                            reward_window.append(info['episode']['r'])
+                            raw_reward = info['episode']['r'][0]
+                            reward_window.append(raw_reward)
+                            current_std = reward_statistics.float_std()[k] + 1e-8
+                            scaled_reward = raw_reward / current_std
                             if len(reward_window) > args.rolling_window:
                                 reward_window.pop(0)
+                            print(raw_reward)
+                            print(reward_window)
+                            print(scaled_reward)
+                            print(global_step <=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0) or ("freeway" in args.env_ids[i].lower()))
 
-                            if global_step<=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0):
-                                writer.add_scalar(f"train/rolling_episodic_return", np.mean(reward_window), global_step)
+                            if global_step <=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0) or ("freeway" in args.env_ids[i].lower()):
+                                writer.add_scalar(f"train/rolling_episodic_return_raw", np.mean(reward_window), global_step)
 
-                            writer.add_scalar(f"train/episodic_return", info["episode"]["r"], global_step)
-                            writer.add_scalar(f"train/episodic_length", info["episode"]["l"], global_step)
+                            writer.add_scalar(f"train/episodic_return_raw", raw_reward, global_step)
+                            writer.add_scalar(f"train/episodic_return_scaled", scaled_reward, global_step)
+                            writer.add_scalar(f"train/episodic_length", info["episode"]["l"][0], global_step)
                 if args.exp_type == "ppo_metaworld":#take it as a done flag
                     if truncations:
                         print("Truncated, env resetting!")
