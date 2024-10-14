@@ -32,6 +32,7 @@ MIN_SQUARED_GRAD = 0.01
 GAMMA = 0.99
 EPSILON = 1.0
 SEED=10
+EVAL_INTERVAL=10000
 
 def set_seed(seed):
     random.seed(seed)            
@@ -42,6 +43,29 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)     
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False    
+
+def evaluate_policy(test_envs, policy_net, num_actions=6, num_episodes=1):
+    """Evaluate the policy in test envs with no exploration: epsilon=0"""
+    all_rews=[]
+    for i,test_env in enumerate(test_envs):
+        total_reward = 0.0
+        for _ in range(num_episodes):
+            s, _ = test_env.reset(seed=SEED+1)
+            s = get_state(s)
+            done = False
+            episode_reward = 0
+
+            while not done:
+                with torch.no_grad():
+                    action = policy_net(s).max(1)[1].view(1, 1)
+                s_prime, reward, terminated, truncated, info = test_env.step(action)
+                episode_reward += reward
+                s_prime = get_state(s_prime)
+                s = s_prime
+                done = terminated or truncated
+            total_reward += episode_reward
+        all_rews.append(total_reward / num_episodes)
+    return all_rews
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -121,19 +145,12 @@ def train(sample, policy_net, target_net, optimizer):
 
     wandb.log({"loss": loss.item()})
 
-def dqn(env, replay_off, target_off, output_file_name, store_intermediate_result=False, load_path=None, step_size=STEP_SIZE):
-    in_channels = 10 #env.state_shape()[2]
-    num_actions = 6#env.num_actions()
-    # wandb.log({f"training start-in_channels=": in_channels, "training start-num_actions":num_actions})
-
-    policy_net = QNetwork(in_channels, num_actions).to(device)
+def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_buffer, store_intermediate_result=False, load_path=None, step_size=STEP_SIZE, frame_step=0):
     replay_start_size = 0
-    if not target_off:
-        target_net = QNetwork(in_channels, num_actions).to(device)
-        target_net.load_state_dict(policy_net.state_dict())
+    in_channels=10
+    num_actions=6
 
     if not replay_off:
-        r_buffer = replay_buffer(REPLAY_BUFFER_SIZE)
         replay_start_size = REPLAY_START_SIZE
 
     optimizer = optim.RMSprop(policy_net.parameters(), lr=step_size, alpha=SQUARED_GRAD_MOMENTUM, centered=True, eps=MIN_SQUARED_GRAD)
@@ -201,8 +218,16 @@ def dqn(env, replay_off, target_off, output_file_name, store_intermediate_result
 
             G += reward.item()
             t += 1
+            frame_step +=1
             s = s_prime
 
+            # Evaluate every 10,000 frame steps
+            if frame_step % EVAL_INTERVAL == 0:
+                print(f"Evaluation at frame {frame_step}")
+                eval_reward = evaluate_policy(test_envs, policy_net, num_actions)
+                for i, r in enumerate(eval_reward):
+                    wandb.log({f"test/{env_ids[i]}__eval_R": r, "frame_step":frame_step})
+                
         e += 1
         data_return.append(G)
         frame_stamp.append(t)
@@ -210,9 +235,9 @@ def dqn(env, replay_off, target_off, output_file_name, store_intermediate_result
         avg_return = 0.99 * avg_return + 0.01 * G
         if e % 50 == 0:
             # logging.info(f"Episode {e} | Return: {G} | Avg return: {numpy.around(avg_return, 2)} | Frame: {t} | Time per frame: {(time.time()-t_start)/t}")
-            print(f'"avg_return": {avg_return}, "episode": {e}, "return": {G}, "frame_step":{t}')
-            wandb.log({f"{args.env}_avg_return": avg_return, "episode": e, f"{args.env}_return": G, "frame_step":t})
-
+            print(f'"avg_return": {avg_return}, "episode": {e}, "return": {G}, "frame_step":{frame_step}')
+            wandb.log({f"{args.env}_avg_return": avg_return, "episode": e, "frame_step":frame_step})
+        wandb.log({f"{args.env}_return": G, "frame_step":frame_step})
         # if "episode" in info:
         #     writer.add_scalar(f"charts/{avg_return}_episodic_return", info["episode"]["r"], t)
         #     writer.add_scalar(f"charts/{avg_return}_episodic_length", info["episode"]["l"], t)
@@ -230,12 +255,13 @@ def dqn(env, replay_off, target_off, output_file_name, store_intermediate_result
         #         'frame_stamp_per_run': frame_stamp,
         #         'replay_buffer': r_buffer if not replay_off else [],
         #     }, output_file_name)
+    return frame_step
 
 if __name__ == "__main__":
     from torch.utils.tensorboard import SummaryWriter
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=10)
-    parser.add_argument('--env', type=str, default='breakout')
+    parser.add_argument('--env', type=str, nargs='+', default=["MinAtar/Breakout-v0","MinAtar/Freeway-v0", "MinAtar/Asterix-v0", "MinAtar/Seaquest-v0", "MinAtar/SpaceInvaders-v0"])
     parser.add_argument('--replay-off', action='store_true', default=False)
     parser.add_argument('--target-off', action='store_true', default=False)
     parser.add_argument('--load-path', type=str)
@@ -274,10 +300,23 @@ if __name__ == "__main__":
 
     # env = Environment(args.env)
     from env import make_minatar_env
-    env_ids=["MinAtar/Breakout-v0","MinAtar/Asterix-v0", "MinAtar/Freeway-v0", "MinAtar/Seaquest-v0", "MinAtar/SpaceInvaders-v0"]
     train_envs=[]
+    test_envs=[]
+    env_ids=["MinAtar/Breakout-v0","MinAtar/Freeway-v0", "MinAtar/Asterix-v0", "MinAtar/Seaquest-v0", "MinAtar/SpaceInvaders-v0"]
     for i in env_ids:
         train_envs.append(make_minatar_env(env_id=i, idx=0, capture_video=False, run_name="DQN_minatar",seed=SEED)())
+        test_envs.append(make_minatar_env(env_id=i, idx=0, capture_video=False, run_name="DQN_minatar",seed=SEED+1)())
     # writer = SummaryWriter(f"runs/{args.env}_replayon_targeton")
+    target_off,replay_off=False,False
+
+    policy_net = QNetwork(in_channels=10, num_actions=6).to(device)
+    if not target_off:
+        target_net = QNetwork(in_channels=10, num_actions=6).to(device)
+        target_net.load_state_dict(policy_net.state_dict())
+
+    if not replay_off:
+        r_buffer = replay_buffer(REPLAY_BUFFER_SIZE)
+
+    frame_step=0
     for i,env in enumerate(train_envs):
-        dqn(env, False, False, "dqn_out", load_path=args.load_path)
+        frame_step=dqn(frame_step=frame_step, env=env, replay_off=replay_off, target_off=target_off,output_file_name="dqn_out", policy_net=policy_net, target_net=target_net,r_buffer=r_buffer, load_path=args.load_path)
