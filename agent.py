@@ -177,12 +177,16 @@ class PPO_Conv_Agent(nn.Module):
         self.critic_fc2 = nn.Linear(hidden_size, hidden_size)
         self.critic_out = nn.Linear(hidden_size, 1)
 
-        self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
-        self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
-        
+        # self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
+        # self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        self.init_params_dict = {}
+        for name, param in self.named_parameters():
+            self.init_params_dict[name] = param.data.clone().detach()
+
     def set_flat_params(self):
-        self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
-        self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        self.get_flat_params()
+        # self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
+        # self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
 
     def forward(self, x):
         x = F.relu(self.conv(x))
@@ -214,13 +218,25 @@ class PPO_Conv_Agent(nn.Module):
             
         return action, probs.log_prob(action), probs.entropy(), value
 
-    def get_flat_params(self, *modules):
-        params = []
-        for module in modules:
-            params.append(torch.cat([p.flatten() for p in module.parameters()]))
-        return torch.cat(params)
+    def get_flat_params(self):
+        # def get_flat_params(self, *modules):
+        # params = []
+        # for module in modules:
+        #     params.append(torch.cat([p.flatten() for p in module.parameters()]))
+        # return torch.cat(params)
+        self.init_params_dict = {}
+        for name, param in self.named_parameters():
+            self.init_params_dict[name] = param.data.clone().detach()
 
     def compute_l2_loss(self, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
-        curr_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
-        l2_loss = 0.5 * ((curr_params.to(device) - self.init_critic_params.to(device)) ** 2).sum()
-        return l2_loss
+        # curr_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
+        # l2_loss = 0.5 * ((curr_params.to(device) - self.init_critic_params.to(device)) ** 2).sum()
+        # return l2_loss
+        l2_loss = 0.0
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                init_param = self.init_params_dict[name].to(device)
+                #L2 distance between current and initial parameters
+                diff = param.to(device) - init_param
+                l2_loss += torch.sum(diff ** 2)
+        return 0.5 * l2_loss

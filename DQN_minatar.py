@@ -47,6 +47,7 @@ def set_seed(seed):
 def evaluate_policy(test_envs, policy_net, num_actions=6, num_episodes=1):
     """Evaluate the policy in test envs with no exploration: epsilon=0"""
     all_rews=[]
+    
     for i,test_env in enumerate(test_envs):
         total_reward = 0.0
         for _ in range(num_episodes):
@@ -180,16 +181,20 @@ def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_
     policy_net_update_counter = policy_net_update_counter_init
     t_start = time.time()
 
+    eval_cumulative_rewards = [0.0] * len(test_envs)
+    eval_count = 0
+    eval_size=10
+
     while t < NUM_FRAMES:
         G = 0.0
         s, _ = env.reset(seed=SEED) 
         s = get_state(s)
         is_terminated = False
 
-        steps_spent=0
+        # steps_spent=0
         while(not is_terminated) and t < NUM_FRAMES:
-            steps_spent+=1
-            wandb.log({f"{args.env}_steps_spent": steps_spent})
+            # steps_spent+=1
+            # wandb.log({f"{args.env}_steps_spent": steps_spent})
             # Generate data
             s_prime, action, reward, is_terminated, info = world_dynamics(t, replay_start_size, num_actions, s, env, policy_net)
 
@@ -225,8 +230,16 @@ def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_
             if frame_step % EVAL_INTERVAL == 0:
                 print(f"Evaluation at frame {frame_step}")
                 eval_reward = evaluate_policy(test_envs, policy_net, num_actions)
-                for i, r in enumerate(eval_reward):
-                    wandb.log({f"test/{env_ids[i]}__eval_R": r, "frame_step":frame_step})
+                eval_count += 1
+
+                for k, r in enumerate(eval_reward):
+                    eval_cumulative_rewards[k] += r 
+                    wandb.log({f"test/{env_ids[k]}__eval_R": r, 
+                    f"test/{env_ids[k]}__eval_R_avg": eval_cumulative_rewards[k] / eval_count,
+                                "frame_step":frame_step})
+                if eval_count >= eval_size:
+                    eval_cumulative_rewards = [0.0] * len(test_envs)
+                    eval_count = 0
                 
         e += 1
         data_return.append(G)

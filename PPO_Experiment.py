@@ -82,7 +82,7 @@ def evaluate_single_env(agent, env, eval_episodes, device, max_steps=10000):
     
     return mean_reward, mean_steps
 
-def evaluate_parallel_env(agent, envs, eval_episodes, device, max_steps=1000):
+def evaluate_parallel_env(agent, envs, eval_episodes, device, max_steps=10000):
     agent.eval()
     total_rewards = []
     steps_per_episode = []
@@ -396,19 +396,14 @@ if __name__ == "__main__":
                 writer.add_scalar(f"train/reward_std", reward_statistics.float_std().mean(), global_step)
 
                 if "final_info" in infos:
-                    print(reward_statistics.float_std())
                     for k, info in enumerate(infos["final_info"]):
                         if info and "episode" in info:
                             raw_reward = info['episode']['r'][0]
                             reward_window.append(raw_reward)
-                            current_std = reward_statistics.float_std()[k] + 1e-8
+                            current_std = reward_statistics.standard_deviation()[k] + 1e-8
                             scaled_reward = raw_reward / current_std
                             if len(reward_window) > args.rolling_window:
                                 reward_window.pop(0)
-                            print(raw_reward)
-                            print(reward_window)
-                            print(scaled_reward)
-                            print(global_step <=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0) or ("freeway" in args.env_ids[i].lower()))
 
                             if global_step <=args.num_envs or (len(reward_window) == args.rolling_window and global_step % 10000 == 0) or ("freeway" in args.env_ids[i].lower()):
                                 writer.add_scalar(f"train/rolling_episodic_return_raw", np.mean(reward_window), global_step)
