@@ -154,6 +154,12 @@ class Args:
     """ l2 init loss's coefficient"""
     periodic_l2: bool = False
     """Toggle for the usage of L2 init loss on every parameter: theta_t-1 instead of paramater at theta_0"""
+    wandb_log_off: bool = True
+    """Toggle true for turning off wandb log files"""
+    reward_rescale: bool = True
+    """Toggle true for turning on reward rescale"""
+    value_norm: bool = True
+    """Toggles value normalization"""
     rolling_window: int = 100
     """ mean calculation's window size """
     eval_interval: int = 50000  
@@ -277,16 +283,27 @@ if __name__ == "__main__":
     if args.track:
         import wandb
 
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=False,
-            settings=wandb.Settings(console="off",log_internal=str(Path(__file__).parent / 'wandb' / 'null')),
-        )
+        if args.wandb_log_off:
+            wandb.init(
+                project=args.wandb_project_name,
+                entity=args.wandb_entity,
+                sync_tensorboard=True,
+                config=vars(args),
+                name=run_name,
+                monitor_gym=True,
+                save_code=False,
+                settings=wandb.Settings(console="off",log_internal=str(Path(__file__).parent / 'wandb' / 'null')),
+            )
+        else:
+            wandb.init(
+                project=args.wandb_project_name,
+                entity=args.wandb_entity,
+                sync_tensorboard=True,
+                config=vars(args),
+                name=run_name,
+                monitor_gym=True,
+                save_code=True
+            )
     
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -338,6 +355,9 @@ if __name__ == "__main__":
         reward_window=[]
 
         reward_statistics = RUNNINGSTATISTICS()
+        value_MU = 0.0  
+        value_STD = 1.0 
+        alpha = 0.001
 
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
@@ -357,6 +377,8 @@ if __name__ == "__main__":
                 dones[step] = next_done
                 with torch.no_grad():
                     action, logprob, _, value = agent.get_action_and_value(next_obs)
+                    if args.value_norm:
+                        value = value * value_STD + value_MU
 
                     values[step] = value.flatten()
                 actions[step] = action
@@ -364,14 +386,16 @@ if __name__ == "__main__":
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
                 
-                reward_tensor = torch.tensor(reward).to(device).view(-1)
-                R_t = args.gamma * R_t_1 + reward
-                reward_statistics.add(R_t)
-                R_t_1 = R_t
-                scaled_reward = reward_tensor / (reward_statistics.standard_deviation() + 1e-8)
+                if args.reward_rescale:
+                    reward_tensor = torch.tensor(reward).to(device).view(-1)
+                    R_t = args.gamma * R_t_1 + reward
+                    reward_statistics.add(R_t)
+                    R_t_1 = R_t
+                    scaled_reward = reward_tensor / (reward_statistics.standard_deviation() + 1e-8)
 
-                rewards[step] = scaled_reward
-                #rewards[step] = torch.tensor(reward).to(device).view(-1)
+                    rewards[step] = scaled_reward
+                else:
+                    rewards[step] = torch.tensor(reward).to(device).view(-1)
 
                 next_done = np.logical_or(terminations, truncations)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
@@ -391,17 +415,20 @@ if __name__ == "__main__":
                             mean_reward = torch.stack(episode_rewards).mean().item()
                             writer.add_scalar(f"eval/mean_reward", mean_reward, global_step)
                             episode_rewards = []
-                            
-                writer.add_scalar(f"train/reward_mean", reward_statistics.get_mean().mean(), global_step)
-                writer.add_scalar(f"train/reward_std", reward_statistics.float_std().mean(), global_step)
+                
+                if args.reward_rescale:
+                    writer.add_scalar(f"train/reward_mean", reward_statistics.get_mean().mean(), global_step)
+                    writer.add_scalar(f"train/reward_std", reward_statistics.float_std().mean(), global_step)
 
                 if "final_info" in infos:
                     for k, info in enumerate(infos["final_info"]):
                         if info and "episode" in info:
                             raw_reward = info['episode']['r'][0]
                             reward_window.append(raw_reward)
-                            current_std = reward_statistics.standard_deviation()[k] + 1e-8
-                            scaled_reward = raw_reward / current_std
+                            if args.reward_rescale:
+                                current_std = reward_statistics.standard_deviation()[k] + 1e-8
+                                scaled_reward = raw_reward / current_std
+
                             if len(reward_window) > args.rolling_window:
                                 reward_window.pop(0)
 
@@ -409,7 +436,8 @@ if __name__ == "__main__":
                                 writer.add_scalar(f"train/rolling_episodic_return_raw", np.mean(reward_window), global_step)
 
                             writer.add_scalar(f"train/episodic_return_raw", raw_reward, global_step)
-                            writer.add_scalar(f"train/episodic_return_scaled", scaled_reward, global_step)
+                            if args.reward_rescale:
+                                writer.add_scalar(f"train/episodic_return_scaled", scaled_reward, global_step)
                             writer.add_scalar(f"train/episodic_length", info["episode"]["l"][0], global_step)
                 if args.exp_type == "ppo_metaworld":#take it as a done flag
                     if truncations:
@@ -428,6 +456,10 @@ if __name__ == "__main__":
             # bootstrap value if not done
             with torch.no_grad():
                 next_value = agent.get_value(next_obs).reshape(1, -1)
+                #scale back
+                if args.value_norm:
+                    next_value = next_value * value_STD + value_MU
+
                 advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
@@ -464,6 +496,8 @@ if __name__ == "__main__":
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                    if args.value_norm:
+                        newvalue = newvalue * value_STD + value_MU
 
                     logratio = newlogprob - b_logprobs[mb_inds]
                     ratio = logratio.exp()
@@ -484,6 +518,16 @@ if __name__ == "__main__":
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                     # Value loss
+                    writer.add_scalar("losses/b_returns[mb_inds]_raw", b_returns[mb_inds].mean().item(), global_step)
+                    if args.value_norm:
+                        mb_mean = b_returns[mb_inds].mean().item()
+                        mb_std = b_returns[mb_inds].std().item()
+                        value_MU = (1 - alpha) * value_MU + alpha * mb_mean
+                        value_STD = (1 - alpha) * value_STD + alpha * mb_std
+                        b_returns[mb_inds] = (b_returns[mb_inds] - value_MU) / (value_STD + 1e-8)
+
+                        writer.add_scalar("losses/b_returns[mb_inds]_normalized", b_returns[mb_inds].mean().item(), global_step)
+                    
                     newvalue = newvalue.view(-1)
                     if args.clip_vloss:
                         v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
