@@ -92,7 +92,7 @@ def make_minatar_env(env_id, idx, capture_video, run_name, seed=42,obs_size = (1
     """ available usage: 
     env_id from ["MinAtar/Asterix-v0", "MinAtar/Breakout-v0", "MinAtar/Freeway-v0", "MinAtar/Seaquest-v0", "MinAtar/SpaceInvaders-v0", "MinAtar/Asterix-v1", "MinAtar/Breakout-v1", "MinAtar/Freeway-v1", "MinAtar/Seaquest-v1", "MinAtar/SpaceInvaders-v1"]
     """
-    print(f"Setting up MinAtar env: {env_id}")
+    # print(f"Setting up MinAtar env: {env_id}")
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
