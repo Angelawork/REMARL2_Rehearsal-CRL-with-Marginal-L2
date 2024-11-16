@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent
+from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent, WeightClipping
 from pathlib import Path
 
 class RUNNINGSTATISTICS:
@@ -28,13 +28,28 @@ class RUNNINGSTATISTICS:
         delta2 = x - self.mean
         self.m2 += delta * delta2
 
+    def SampleMeanVar(self, x, mean, p):
+        self.count += 1
+        n=self.count
+        delta = x - mean
+        self.mean = mean+ (delta / n)
+        delta2 = x - self.mean
+        p = p + delta * delta2
+        if n >= 2:
+            var = p / (n-1)
+        else:
+            var = 1
+        
+        self.m2=p
+        return p,self.mean,var
+
     def variance(self):
         return self.m2 / (self.count)
 
     def float_std(self):
         return self.variance() ** 0.5
     
-    def standard_deviation(self):
+    def std(self):
         return torch.tensor(self.variance() ** 0.5).to(device)
 
     def get_mean(self):
@@ -63,7 +78,7 @@ def evaluate_single_env(agent, env, eval_episodes, device, max_steps=10000):
 
                 episode_reward += reward
                 # reward_tensor = torch.tensor(reward).to(device).view(-1)
-                # scaled_reward = reward_tensor / (reward_statistics.standard_deviation() + 1e-8)
+                # scaled_reward = reward_tensor / (reward_statistics.std() + 1e-8)
 
                 # episode_reward += scaled_reward
                 obs = torch.tensor(next_obs, dtype=torch.float32).to(device)
@@ -148,18 +163,35 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
+
+    use_weight_clip: bool = False
+    """weight clipping"""
+    weight_clipping: float = 3.0
+    """Weight Clipping"""
+    clip_last_layer: int = 1
+    """Clip the last layer of the network"""
+
     use_l2_loss: bool = False
     """Toggle for the usage of L2 init loss"""
     l2_coef: float = 0.01
     """ l2 init loss's coefficient"""
     periodic_l2: bool = False
     """Toggle for the usage of L2 init loss on every parameter: theta_t-1 instead of paramater at theta_0"""
+   
     wandb_log_off: bool = True
     """Toggle true for turning off wandb log files"""
+
     reward_rescale: bool = True
     """Toggle true for turning on reward rescale"""
+    global_reward_rescale: bool = True
+    """Toggle true for turning on global reward rescale"""
+
     value_norm: bool = True
     """Toggles value normalization"""
+    global_value_norm: bool = True
+    """Toggles global value normalization"""
+
+
     rolling_window: int = 100
     """ mean calculation's window size """
     eval_interval: int = 50000  
@@ -255,7 +287,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_ids}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.seed}_{args.exp_name}_{args.env_ids}"
 
     # Environment setup
     if args.exp_type == "ppo_metaworld":
@@ -322,6 +354,15 @@ if __name__ == "__main__":
     start_time = time.time()
 
     print(f"Env tasks used in this run: {train_envs}")    
+    #TODO: put MU/STD here?
+    reward_statistics = RUNNINGSTATISTICS()
+    R_t_1 = 0.0
+    rew_P=0.0
+
+    value_MU = 0.0  
+    value_STD = 1.0 
+    alpha = 0.001
+
     for i,envs in enumerate(train_envs):
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
@@ -330,7 +371,10 @@ if __name__ == "__main__":
             elif args.exp_type == "ppo_metaworld":
                 agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
-            optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+            if args.use_weight_clip:
+                optimizer = WeightClipping(agent.parameters(), lr=args.learning_rate, eps=1e-5, beta=args.weight_clipping, clip_last_layer=args.clip_last_layer)
+            else:
+                optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
             # ALGO Logic: Storage setup
             obs_space_shape = envs.observation_space.shape if args.exp_type == "ppo_metaworld" else envs.single_observation_space.shape
@@ -343,7 +387,7 @@ if __name__ == "__main__":
             dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
             values = torch.zeros((args.num_steps, args.num_envs)).to(device)
         else:
-            if args.periodic_l2:
+            if args.periodic_l2 and args.use_l2_loss:
                 agent.set_flat_params()
 
         # TRY NOT TO MODIFY: start the game
@@ -353,12 +397,17 @@ if __name__ == "__main__":
         episode_success_rates=[]
         episode_rewards = []
         reward_window=[]
-
-        reward_statistics = RUNNINGSTATISTICS()
-        value_MU = 0.0  
-        value_STD = 1.0 
-        alpha = 0.001
-
+        
+        # local values for rescale and normalization
+        if args.value_norm and not args.global_value_norm:
+            value_MU = 0.0  
+            value_STD = 1.0 
+            
+        if args.reward_rescale and not args.global_reward_rescale:
+            reward_statistics = RUNNINGSTATISTICS()
+            R_t_1 = 0.0
+            rew_P=0.0
+        
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
             if args.anneal_lr:
@@ -366,7 +415,8 @@ if __name__ == "__main__":
                 lrnow = frac * args.learning_rate
                 optimizer.param_groups[0]["lr"] = lrnow
             
-            R_t_1 = 0.0
+            # R_t_1 = 0.0
+            # TODO
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
 
@@ -388,10 +438,21 @@ if __name__ == "__main__":
                 
                 if args.reward_rescale:
                     reward_tensor = torch.tensor(reward).to(device).view(-1)
-                    R_t = args.gamma * R_t_1 + reward
-                    reward_statistics.add(R_t)
-                    R_t_1 = R_t
-                    scaled_reward = reward_tensor / (reward_statistics.standard_deviation() + 1e-8)
+                    
+
+                    #old scaling
+                    # R_t = args.gamma * R_t_1 + reward
+                    # R_t_1 = R_t 
+                    # reward_statistics.add(R_t)
+                    # scaled_reward = reward_tensor / (reward_statistics.std() + 1e-8)
+
+                    #new scaling 
+                    R_t = args.gamma * R_t_1 + reward  
+                    R_t_1 = R_t  
+                    p,mean_,var=reward_statistics.SampleMeanVar(R_t, mean=0, p=rew_P)
+                    rew_P=p
+                    tmp_var=var
+                    scaled_reward = reward_tensor / (torch.tensor(var, device=reward_tensor.device) ** 0.5 + 1e-8)
 
                     rewards[step] = scaled_reward
                 else:
@@ -417,8 +478,16 @@ if __name__ == "__main__":
                             episode_rewards = []
                 
                 if args.reward_rescale:
-                    writer.add_scalar(f"train/reward_mean", reward_statistics.get_mean().mean(), global_step)
-                    writer.add_scalar(f"train/reward_std", reward_statistics.float_std().mean(), global_step)
+                    #old rew scaling add .mean()
+                    # writer.add_scalar(f"train/reward_mean", reward_statistics.get_mean().mean(), global_step)
+                    # writer.add_scalar(f"train/reward_std", reward_statistics.float_std().mean(), global_step)
+                    #new rew scaling dont need mean()
+                    a=tmp_var ** 0.5 + 1e-8
+                    writer.add_scalar(f"train/reward_mean", mean_.mean(), global_step)
+                    try:
+                        writer.add_scalar(f"train/reward_std", a, global_step)
+                    except:
+                        writer.add_scalar(f"train/reward_std", a.mean(), global_step)
 
                 if "final_info" in infos:
                     for k, info in enumerate(infos["final_info"]):
@@ -426,7 +495,11 @@ if __name__ == "__main__":
                             raw_reward = info['episode']['r'][0]
                             reward_window.append(raw_reward)
                             if args.reward_rescale:
-                                current_std = reward_statistics.standard_deviation()[k] + 1e-8
+                                #old rew scaling
+                                # current_std = reward_statistics.std()[k] + 1e-8
+
+                                #new rew scaling:
+                                current_std = tmp_var[k] ** 0.5 + 1e-8
                                 scaled_reward = raw_reward / current_std
 
                             if len(reward_window) > args.rolling_window:
@@ -447,7 +520,7 @@ if __name__ == "__main__":
                         next_done = torch.zeros(args.num_envs).to(device)
                 
                 if global_step!=0 and global_step % args.eval_interval == 0:
-                    print("Evaluating model performance!")
+                    # print("Evaluating model performance!")
                     for j, eval_env in enumerate(eval_envs):
                         mean_reward, mean_steps = evaluate_parallel_env(agent, eval_env, 1, device)
                         writer.add_scalar(f"test/{args.env_ids[j]}__eval_R", mean_reward, global_step)
@@ -496,8 +569,9 @@ if __name__ == "__main__":
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
-                    if args.value_norm:
-                        newvalue = newvalue * value_STD + value_MU
+                    writer.add_scalar("losses/training_newvalue_raw", newvalue.mean().item(), global_step)
+                    # if args.value_norm: TODO: scale newvalue or not
+                    #     newvalue = newvalue * value_STD + value_MU
 
                     logratio = newlogprob - b_logprobs[mb_inds]
                     ratio = logratio.exp()
@@ -545,10 +619,12 @@ if __name__ == "__main__":
                     entropy_loss = entropy.mean()
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
                     if args.use_l2_loss:
-                        l2_loss = agent.compute_l2_loss(device=device)
+                        l2_loss_critic, l2_loss_actor = agent.compute_l2_loss(device=device)
+                        l2_loss = l2_loss_critic + l2_loss_actor
                         loss += args.l2_coef * l2_loss
-                        writer.add_scalar(f"train/{args.env_ids[i]}__l2_loss", l2_loss, global_step)
-                    writer.add_scalar(f"train/{args.env_ids[i]}__loss", loss, global_step)
+                        writer.add_scalar(f"train/actor_l2_loss", l2_loss_actor, global_step)
+                        writer.add_scalar(f"train/critic_l2_loss", l2_loss_critic, global_step)
+                    writer.add_scalar(f"train/loss", loss, global_step)
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -571,7 +647,7 @@ if __name__ == "__main__":
             writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
             writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
-            print("SPS:", int(global_step / (time.time() - start_time)))
+            # print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         envs.close()
     writer.close()
