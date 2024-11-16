@@ -177,16 +177,16 @@ class PPO_Conv_Agent(nn.Module):
         self.critic_fc2 = nn.Linear(hidden_size, hidden_size)
         self.critic_out = nn.Linear(hidden_size, 1)
 
-        # self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
-        # self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
-        self.init_params_dict = {}
-        for name, param in self.named_parameters():
-            self.init_params_dict[name] = param.data.clone().detach()
+        self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
+        self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        # self.init_params_dict = {}
+        # for name, param in self.named_parameters():
+        #     self.init_params_dict[name] = param.data.clone().detach()
 
     def set_flat_params(self):
-        self.get_flat_params()
-        # self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
-        # self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        # self.get_flat_params()
+        self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
+        self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
 
     def forward(self, x):
         x = F.relu(self.conv(x))
@@ -218,25 +218,89 @@ class PPO_Conv_Agent(nn.Module):
             
         return action, probs.log_prob(action), probs.entropy(), value
 
-    def get_flat_params(self):
-        # def get_flat_params(self, *modules):
-        # params = []
-        # for module in modules:
-        #     params.append(torch.cat([p.flatten() for p in module.parameters()]))
-        # return torch.cat(params)
-        self.init_params_dict = {}
-        for name, param in self.named_parameters():
-            self.init_params_dict[name] = param.data.clone().detach()
+    def get_flat_params(self, *modules):
+        params = []
+        for module in modules:
+            params.append(torch.cat([p.flatten() for p in module.parameters()]))
+        return torch.cat(params)
+    # def get_flat_params(self):
+        
+    #     self.init_params_dict = {}
+    #     for name, param in self.named_parameters():
+    #         self.init_params_dict[name] = param.data.clone().detach()
 
     def compute_l2_loss(self, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
-        # curr_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
-        # l2_loss = 0.5 * ((curr_params.to(device) - self.init_critic_params.to(device)) ** 2).sum()
-        # return l2_loss
-        l2_loss = 0.0
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                init_param = self.init_params_dict[name].to(device)
-                #L2 distance between current and initial parameters
-                diff = param.to(device) - init_param
-                l2_loss += torch.sum(diff ** 2)
-        return 0.5 * l2_loss
+        curr_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
+        curr_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+
+        l2_loss_critic = 0.5 * ((curr_critic_params - self.init_critic_params.to(device)) ** 2).sum()
+        l2_loss_actor = 0.5 * ((curr_actor_params - self.init_actor_params.to(device)) ** 2).sum()
+
+        l2_loss = l2_loss_critic + l2_loss_actor
+        
+        return l2_loss_critic, l2_loss_actor
+
+        # l2_loss = 0.0
+        # for name, param in self.named_parameters():
+        #     if param.requires_grad:
+        #         init_param = self.init_params_dict[name].to(device)
+        #         #L2 distance between current and initial parameters
+        #         diff = param.to(device) - init_param
+        #         l2_loss += torch.sum(diff ** 2)
+        # return 0.5 * l2_loss
+
+    def parseval_regularization(self,s,lambda_parseval=0.01):
+        parseval_loss = 0.0
+
+        for layer in [self.fc1,self.actor_fc1, self.actor_fc2,self.critic_fc1, self.critic_fc2]:
+            W = layer.weight
+            identity = torch.eye(W.size(0), device=W.device)
+            parseval_loss += torch.norm(W @ W.T - s * identity, p='fro') ** 2
+
+        return lambda_parseval * parseval_loss
+
+import torch, math
+
+class InitBounds:
+    '''
+    A class to calculate the initial bounds for weight clipping.
+    Uniform Kaiming initialization bounds are used.
+    Since bias requires knowledge of the previous layer's weights, we keep track of the previous weight tensor in this class.
+    Linear: https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py#L106
+    Conv2d: https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/conv.py#L144
+    '''
+    def __init__(self):
+        self.previous_weight = None
+
+    def get(self, p):
+        if p.dim() == 1:
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.previous_weight)
+            return 1.0 / math.sqrt(fan_in)
+        elif p.dim() == 2 or p.dim() == 4:
+            self.previous_weight = p
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(p)
+            return  1.0 / math.sqrt(fan_in)
+        else:
+            raise ValueError("Unsupported tensor dimension: {}".format(p.dim()))
+
+class WeightClipping(torch.optim.Optimizer):
+    def __init__(self, params, beta=1.0, optimizer=torch.optim.Adam, clip_last_layer=True, **kwargs):
+        defaults = dict(beta=beta, clip_last_layer=clip_last_layer)
+        super(WeightClipping, self).__init__(params, defaults)
+        self.optimizer = optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.optimizer.param_groups
+        self.defaults.update(self.optimizer.defaults)
+        self.init_bounds = InitBounds()
+
+    def step(self):
+        self.optimizer.step()
+        self.weight_clipping()
+
+    def weight_clipping(self):
+        for group in self.param_groups:
+            for i, p in enumerate(group["params"]):
+                if i >= len(group["params"])-2 and not group["clip_last_layer"]:
+                    # do not clip last layer of weights/biases
+                    continue
+                bound = self.init_bounds.get(p)
+                p.data.clamp_(-group["beta"] * bound, group["beta"] * bound)
