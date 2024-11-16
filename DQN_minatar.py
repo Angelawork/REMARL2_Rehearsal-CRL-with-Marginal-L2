@@ -10,6 +10,7 @@ from pathlib import Path
 
 from collections import namedtuple
 from minatar import Environment
+import torch.autograd as autograd
 
 logger = logging.getLogger("wandb")
 logger.setLevel(logging.ERROR)
@@ -33,6 +34,75 @@ GAMMA = 0.99
 EPSILON = 1.0
 SEED=10
 EVAL_INTERVAL=10000
+
+VALUE_NORM=False
+
+EWC_lambda=1000
+
+EWC=False
+Online_EWC=True
+
+class DQN_value_norm:
+    def __init__(self):
+        self.return_mean = 0
+        self.return_std = 1
+        self.count = 0
+        self.alpha = 0.001
+
+    def update(self, returns):
+        new_mean = returns.mean()
+        new_std = returns.std()
+        self.return_mean = (1-self.alpha) * self.return_mean + self.alpha * new_mean
+        self.return_std = (1-self.alpha) * self.return_std + self.alpha * new_std
+        self.count += 1
+
+    def normalized_target(self, target):
+        return (target - self.return_mean) / (self.return_std + 1e-8)
+
+
+class OnlineEWC:
+    def __init__(self, model, gamma=0.9):
+        self.model = model
+        self.gamma = gamma  # decay factor for online EWC
+        # Store only trainable parameters
+        self.params = {name: param for name, param in model.named_parameters() if param.requires_grad}
+        self.F_accum = {name: torch.zeros_like(param) for name, param in self.params.items()}
+        self.prev_task_params = {}
+
+    def update_fisher_information(self, experience, criterion):
+        current_fisher = {name: torch.zeros_like(param) for name, param in self.params.items()}
+        
+        self.model.eval()
+
+        for s, s_prime, action, reward, is_terminated in experience:
+            self.model.zero_grad()
+            s = s.to(next(self.model.parameters()).device)
+            action = action.to(next(self.model.parameters()).device).long().reshape(-1)
+            reward = reward.to(next(self.model.parameters()).device).float()
+
+            output = self.model(s)
+            selected_q_values = output.gather(1, action.unsqueeze(1)).squeeze(1)
+            loss = criterion(selected_q_values, reward.squeeze(-1))
+            loss.backward()
+
+            for name, param in self.params.items():
+                if param.grad is not None:
+                    current_fisher[name] += (param.grad ** 2) / len(experience)
+
+        # Update cumulative Fisher info
+        for name in self.F_accum:
+            self.F_accum[name] = self.gamma * self.F_accum[name] + current_fisher[name]
+        
+        # Store current param
+        self.prev_task_params = {name: param.clone() for name, param in self.params.items()}
+
+    def ewc_loss(self):
+        ewc_loss = 0.0
+        for name, param in self.params.items():
+            if name in self.prev_task_params:
+                fisher_term = self.F_accum[name] * (param - self.prev_task_params[name]) ** 2
+                ewc_loss += fisher_term.sum()
+        return ewc_loss
 
 def set_seed(seed):
     random.seed(seed)            
@@ -69,6 +139,7 @@ def evaluate_policy(test_envs, policy_net, num_actions=6, num_episodes=1):
     return all_rews
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+value_norm = DQN_value_norm()
 
 class QNetwork(nn.Module):
     def __init__(self, in_channels, num_actions):
@@ -85,6 +156,43 @@ class QNetwork(nn.Module):
         x = f.relu(self.conv(x))
         x = f.relu(self.fc_hidden(x.view(x.size(0), -1)))
         return self.output(x)
+
+    def compute_fisher_information(self, experience, criterion): 
+        # calculate once or continue sampling to update value? 1. only pull towards the single batch
+        fisher_information = {name: torch.zeros_like(param) for name, param in self.named_parameters()}
+        
+        self.eval()
+        for s, s_prime, action, reward, is_terminated in experience:
+            self.zero_grad()
+            s = s.to(next(self.parameters()).device)
+            action = action.to(next(self.parameters()).device).long().reshape(-1)
+            reward = reward.to(next(self.parameters()).device).float()
+
+            output = self(s)
+            selected_q_values = output.gather(1, action.unsqueeze(1)).squeeze(1)
+            # Action shape: torch.Size([1])
+            # Selected Q-values shape: torch.Size([1])
+            # Reward shape: torch.Size([1, 1])
+            # Output shape: torch.Size([1, 6])
+            loss = criterion(selected_q_values, reward.squeeze(-1))
+            # loss = criterion(output, action)
+
+            loss.backward()
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    fisher_information[name] += (param.grad ** 2) / len(experience)
+        return fisher_information
+    
+    def store_optimal_weights(self):
+        return {name: param.clone() for name, param in self.named_parameters()}
+
+    def ewc_loss(self, fisher_information, optimal_weights, lambda_ewc=EWC_lambda):
+        ewc_loss = 0
+        for name, param in self.named_parameters():
+            if name in fisher_information:
+                ewc_loss += (fisher_information[name] * (param - optimal_weights[name]) ** 2).sum()
+        return lambda_ewc * ewc_loss
+
 transition = namedtuple('transition', 'state, next_state, action, reward, is_terminal')
 class replay_buffer:
     def __init__(self, buffer_size):
@@ -121,7 +229,9 @@ def world_dynamics(t, replay_start_size, num_actions, s, env, policy_net):
     info = {"episode": {"r": reward, "l": t}} if terminated else {}
     return s_prime, action, torch.tensor([[reward]], device=device).float(), torch.tensor([[terminated]], device=device), info
 
-def train(sample, policy_net, target_net, optimizer):
+def train(sample, policy_net, target_net, optimizer, 
+        frame_step, fisher_information=None, 
+        optimal_weights=None, lambda_ewc=1.0, online_ewc=None):
     batch_samples = transition(*zip(*sample))
     states = torch.cat(batch_samples.state)
     next_states = torch.cat(batch_samples.next_state)
@@ -138,15 +248,38 @@ def train(sample, policy_net, target_net, optimizer):
         Q_s_prime_a_prime[none_terminal_next_state_index] = target_net(none_terminal_next_states).detach().max(1)[0].unsqueeze(1)
 
     target = rewards + GAMMA * Q_s_prime_a_prime
-    loss = f.smooth_l1_loss(target, Q_s_a)
+    value_norm.update(target)
+    normalized_target = value_norm.normalized_target(target)
+    if not VALUE_NORM:
+        loss = f.smooth_l1_loss(target, Q_s_a)
+    else:
+        loss = f.smooth_l1_loss(normalized_target, Q_s_a)
+        wandb.log({"raw_target": target.mean().item(),"normalized_target": normalized_target.mean().item(),"frame_step":frame_step})
     
+    if EWC and fisher_information and optimal_weights:
+        ewc_penalty = policy_net.ewc_loss(fisher_information, optimal_weights, lambda_ewc)
+        loss += ewc_penalty
+        wandb.log({"ewc_penalty": ewc_penalty.item(),"frame_step":frame_step})
+        # scale up lambda to check whether performance fail at later env: 
+        # if 2 score has similar panelty and similar performance, then it doesnt work
+        # check if param grad changed
+    
+    if Online_EWC:
+        ewc_loss = online_ewc.ewc_loss()
+        loss += lambda_ewc * ewc_loss
+        wandb.log({"online_ewc_penalty": ewc_loss.item(), "frame_step": frame_step})
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    wandb.log({"loss": loss.item()})
+    wandb.log({"loss": loss.item(),"frame_step":frame_step})
 
-def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_buffer, store_intermediate_result=False, load_path=None, step_size=STEP_SIZE, frame_step=0):
+def dqn(env, replay_off, target_off, output_file_name, policy_net, 
+        target_net,r_buffer, online_ewc=None, store_intermediate_result=False, 
+        load_path=None, step_size=STEP_SIZE, frame_step=0,
+        fisher_information=None, 
+        optimal_weights=None,):
     replay_start_size = 0
     in_channels=10
     num_actions=6
@@ -213,10 +346,14 @@ def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_
             # Train every n number of frames defined by TRAINING_FREQ
             if t % TRAINING_FREQ == 0 and sample is not None:
                 if target_off:
-                    train(sample, policy_net, policy_net, optimizer)
+                    train(sample, policy_net, policy_net, optimizer, 
+                    frame_step,fisher_information=fisher_information, 
+                    optimal_weights=optimal_weights, online_ewc=online_ewc)
                 else:
                     policy_net_update_counter += 1
-                    train(sample, policy_net, target_net, optimizer)
+                    train(sample, policy_net, target_net, optimizer, 
+                    frame_step,fisher_information=fisher_information, 
+                    optimal_weights=optimal_weights, online_ewc=online_ewc)
 
             if not target_off and policy_net_update_counter > 0 and policy_net_update_counter % TARGET_NETWORK_UPDATE_FREQ == 0:
                 target_net.load_state_dict(policy_net.state_dict())
@@ -228,7 +365,7 @@ def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_
 
             # Evaluate every 10,000 frame steps
             if frame_step % EVAL_INTERVAL == 0:
-                print(f"Evaluation at frame {frame_step}")
+                # print(f"Evaluation at frame {frame_step}")
                 eval_reward = evaluate_policy(test_envs, policy_net, num_actions)
                 eval_count += 1
 
@@ -240,15 +377,19 @@ def dqn(env, replay_off, target_off, output_file_name, policy_net, target_net,r_
                 if eval_count >= eval_size:
                     eval_cumulative_rewards = [0.0] * len(test_envs)
                     eval_count = 0
-                
+
+        if Online_EWC:
+            experience = r_buffer.sample(min(len(r_buffer.buffer), 1000))
+            online_ewc.update_fisher_information(experience, criterion=f.smooth_l1_loss)
+
         e += 1
         data_return.append(G)
         frame_stamp.append(t)
 
         avg_return = 0.99 * avg_return + 0.01 * G
-        if e % 50 == 0:
+        if e % 10 == 0:
             # logging.info(f"Episode {e} | Return: {G} | Avg return: {numpy.around(avg_return, 2)} | Frame: {t} | Time per frame: {(time.time()-t_start)/t}")
-            print(f'"avg_return": {avg_return}, "episode": {e}, "return": {G}, "frame_step":{frame_step}')
+            # print(f'"avg_return": {avg_return}, "episode": {e}, "return": {G}, "frame_step":{frame_step}')
             wandb.log({f"{args.env}_avg_return": avg_return, "episode": e, "frame_step":frame_step})
         wandb.log({f"{args.env}_return": G, "frame_step":frame_step})
         # if "episode" in info:
@@ -301,13 +442,16 @@ if __name__ == "__main__":
         "gamma": GAMMA,
         "epsilon": EPSILON,
         "seed": SEED,
-        "env": args.env
+        "env": args.env,
+        "EWC": EWC,
+        "VALUE_NORM":VALUE_NORM,
+        "EWC_lambda":EWC_lambda,
     }
     os.environ["WANDB_LOG_LEVEL"] = "error"
     
     wandb.init(project="DQN_minatar", 
                config=config,
-               entity="angela-h",name=f"runs/{args.env}",
+               entity="angela-h",name=f"DQN_onlineEWC:{Online_EWC}={EWC_lambda}_ValueNorm:{VALUE_NORM}/{args.env}",
                settings=wandb.Settings(console="off",log_internal=str(Path(__file__).parent / 'wandb' / 'null')),
                )
 
@@ -330,6 +474,21 @@ if __name__ == "__main__":
     if not replay_off:
         r_buffer = replay_buffer(REPLAY_BUFFER_SIZE)
 
+    online_ewc = OnlineEWC(policy_net, gamma=0.9)
+
     frame_step=0
+    fisher_information=None
+    optimal_weights=None
     for i,env in enumerate(train_envs):
-        frame_step=dqn(frame_step=frame_step, env=env, replay_off=replay_off, target_off=target_off,output_file_name="dqn_out", policy_net=policy_net, target_net=target_net,r_buffer=r_buffer, load_path=args.load_path)
+        frame_step=dqn(frame_step=frame_step, env=env, replay_off=replay_off, 
+            target_off=target_off,output_file_name="dqn_out", policy_net=policy_net, 
+            target_net=target_net,r_buffer=r_buffer, 
+            online_ewc=online_ewc,
+            load_path=args.load_path,fisher_information=fisher_information,optimal_weights=optimal_weights)
+        
+
+        # Compute Fisher Information after each task
+        if EWC:
+            experience = r_buffer.sample(min(len(r_buffer.buffer), 1000))
+            fisher_information = policy_net.compute_fisher_information(experience, f.smooth_l1_loss)
+            optimal_weights = policy_net.store_optimal_weights()
