@@ -171,8 +171,17 @@ class Args:
     clip_last_layer: int = 1
     """Clip the last layer of the network"""
 
+    use_crelu: bool = False
+    """Toggle for the usage of Concat ReLU"""
+
+    use_ewc: bool = False
+    """Toggle for the usage of EWC loss"""
+    ewc_coef: float = 1.0
+
     use_l2_loss: bool = False
     """Toggle for the usage of L2 init loss"""
+    use_l2_0_loss: bool = False
+    """Toggle for the usage of L2-0 init loss"""
     l2_coef: float = 0.01
     """ l2 init loss's coefficient"""
     periodic_l2: bool = False
@@ -363,11 +372,13 @@ if __name__ == "__main__":
     value_STD = 1.0 
     alpha = 0.001
 
+    ewc_buffer={'obs': [], 'actions': []}
+    
     for i,envs in enumerate(train_envs):
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
             if args.exp_type == "ppo_minatar":
-                agent=PPO_Conv_Agent(envs=envs,seed=args.seed).to(device)
+                agent=PPO_Conv_Agent(envs=envs,seed=args.seed,use_crelu=args.use_crelu).to(device)
             elif args.exp_type == "ppo_metaworld":
                 agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
@@ -415,8 +426,6 @@ if __name__ == "__main__":
                 lrnow = frac * args.learning_rate
                 optimizer.param_groups[0]["lr"] = lrnow
             
-            # R_t_1 = 0.0
-            # TODO
             for step in range(0, args.num_steps):
                 global_step += args.num_envs
 
@@ -431,6 +440,7 @@ if __name__ == "__main__":
                         value = value * value_STD + value_MU
 
                     values[step] = value.flatten()
+
                 actions[step] = action
                 logprobs[step] = logprob
                 # TRY NOT TO MODIFY: execute the game and log data.
@@ -569,6 +579,9 @@ if __name__ == "__main__":
                     end = start + args.minibatch_size
                     mb_inds = b_inds[start:end]
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                    if args.use_ewc:
+                        ewc_buffer['obs'].append(b_obs[mb_inds].detach().clone())
+                        ewc_buffer['actions'].append(b_actions[mb_inds].detach().clone())
                     writer.add_scalar("losses/training_newvalue_raw", newvalue.mean().item(), global_step)
                     # if args.value_norm: TODO: scale newvalue or not
                     #     newvalue = newvalue * value_STD + value_MU
@@ -618,13 +631,22 @@ if __name__ == "__main__":
 
                     entropy_loss = entropy.mean()
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                    writer.add_scalar(f"train/original_ppo_loss", loss, global_step)
                     if args.use_l2_loss:
                         l2_loss_critic, l2_loss_actor = agent.compute_l2_loss(device=device)
                         l2_loss = l2_loss_critic + l2_loss_actor
                         loss += args.l2_coef * l2_loss
                         writer.add_scalar(f"train/actor_l2_loss", l2_loss_actor, global_step)
                         writer.add_scalar(f"train/critic_l2_loss", l2_loss_critic, global_step)
-                    writer.add_scalar(f"train/loss", loss, global_step)
+                    if args.use_l2_0_loss:
+                        l2_0_loss = agent.compute_l2_0_loss()
+                        loss += args.l2_coef * l2_0_loss
+                        writer.add_scalar(f"train/l2_0_loss", l2_0_loss, global_step)
+                    if args.use_ewc and i>0:
+                        ewc_loss = agent.ewc_loss()
+                        loss += args.ewc_coef * ewc_loss
+                        writer.add_scalar(f"train/ewc_loss", ewc_loss.item(), global_step)
+                    writer.add_scalar(f"train/total_loss", loss, global_step)
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -633,6 +655,10 @@ if __name__ == "__main__":
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
+            #TODO: reset optimal weights here?
+            # if args.use_ewc:
+            #     #store optimal weights after the entire epoch
+            #     agent.store_optimal_weights()
 
             y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
             var_y = np.var(y_true)
@@ -649,5 +675,19 @@ if __name__ == "__main__":
             writer.add_scalar("losses/explained_variance", explained_var, global_step)
             # print("SPS:", int(global_step / (time.time() - start_time)))
             writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        if args.use_ewc:
+            agent.reset_fisher_information()
+            ewc_obs = torch.cat(ewc_buffer['obs'], dim=0)
+            ewc_actions = torch.cat(ewc_buffer['actions'], dim=0)
+            
+            num_samples = min(10000, ewc_obs.size(0))
+            sampled_indices = torch.randint(0, ewc_obs.size(0), (num_samples,))
+            sampled_obs = ewc_obs[sampled_indices]
+            sampled_actions = ewc_actions[sampled_indices]
+            #fisher-info matrix
+
+            agent.compute_fisher_information(sampled_obs, sampled_actions)
+            ewc_buffer = {'obs': [], 'actions': []}
+            agent.store_optimal_weights()
         envs.close()
     writer.close()

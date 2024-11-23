@@ -7,6 +7,23 @@ from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 import torch.nn.functional as F
 
+class CReLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return torch.cat((x, F.relu(x)), dim=1)
+
+class ConvCReLU(nn.Module):
+
+    def __init__(self, inplace=False):
+        super(ConvCReLU, self).__init__()
+
+    def forward(self, x):
+        # Concatenate along the channel dimension.
+        channel_dim = 1
+        x = torch.cat((x,-x), channel_dim)
+        return F.relu(x)
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -157,25 +174,37 @@ class PPO_metaworld_Agent(nn.Module):
         return action, log_prob_sum, entropy_sum, self.critic(x).unsqueeze(0)
 
 class PPO_Conv_Agent(nn.Module):
-    def __init__(self, envs, hidden_size=64, seed=None):
+    def __init__(self, envs, hidden_size=64, seed=None, use_crelu=False):
         super(PPO_Conv_Agent, self).__init__()
+        self.use_crelu = use_crelu
         if seed is not None:
             torch.manual_seed(seed)
-
+        if use_crelu:
+            self.fc_activation_fn = CReLU()
+            self.conv_activation_fn = ConvCReLU() 
         input_channels = envs.single_observation_space.shape[0] 
         num_actions = envs.single_action_space.n
 
         self.conv = nn.Conv2d(in_channels=input_channels, out_channels=32, kernel_size=2)
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
         self.fc1 = nn.Linear(512, hidden_size)
+        if use_crelu:
+            self.fc1 = nn.Linear(512*2, hidden_size)
+            self.actor_fc1 = nn.Linear(hidden_size * 2, hidden_size)
+            self.actor_fc2 = nn.Linear(hidden_size * 2, hidden_size)
+            self.actor_out = nn.Linear(hidden_size * 2, num_actions)
 
-        self.actor_fc1 = nn.Linear(hidden_size, hidden_size)
-        self.actor_fc2 = nn.Linear(hidden_size, hidden_size)
-        self.actor_out = nn.Linear(hidden_size, num_actions)
+            self.critic_fc1 = nn.Linear(hidden_size * 2, hidden_size)
+            self.critic_fc2 = nn.Linear(hidden_size * 2, hidden_size)
+            self.critic_out = nn.Linear(hidden_size * 2, 1)
+        else:
+            self.actor_fc1 = nn.Linear(hidden_size, hidden_size)
+            self.actor_fc2 = nn.Linear(hidden_size, hidden_size)
+            self.actor_out = nn.Linear(hidden_size, num_actions)
 
-        self.critic_fc1 = nn.Linear(hidden_size, hidden_size)
-        self.critic_fc2 = nn.Linear(hidden_size, hidden_size)
-        self.critic_out = nn.Linear(hidden_size, 1)
+            self.critic_fc1 = nn.Linear(hidden_size, hidden_size)
+            self.critic_fc2 = nn.Linear(hidden_size, hidden_size)
+            self.critic_out = nn.Linear(hidden_size, 1)
 
         self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
         self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
@@ -183,25 +212,42 @@ class PPO_Conv_Agent(nn.Module):
         # for name, param in self.named_parameters():
         #     self.init_params_dict[name] = param.data.clone().detach()
 
+        self.fisher_information = {}
+        self.optimal_weights = {}
+
     def set_flat_params(self):
         # self.get_flat_params()
         self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
         self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
 
     def forward(self, x):
-        x = F.relu(self.conv(x))
-        x = self.pool(x)
+        if self.use_crelu:
+            x = self.conv_activation_fn(self.conv(x))
+            x = self.pool(x)
+            x = x.view(x.size(0), -1)
+            x = self.fc_activation_fn(self.fc1(x))
 
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
+            actor_mean = self.fc_activation_fn(self.actor_fc1(x))
+            actor_mean = self.fc_activation_fn(self.actor_fc2(actor_mean))
+            actor_mean = self.actor_out(actor_mean)
 
-        actor_mean = F.relu(self.actor_fc1(x))
-        actor_mean = F.relu(self.actor_fc2(actor_mean))
-        actor_mean = self.actor_out(actor_mean)
+            critic_value = self.fc_activation_fn(self.critic_fc1(x))
+            critic_value = self.fc_activation_fn(self.critic_fc2(critic_value))
+            critic_value = self.critic_out(critic_value)
+        else:
+            x = F.relu(self.conv(x))
+            x = self.pool(x)
 
-        critic_value = F.relu(self.critic_fc1(x))
-        critic_value = F.relu(self.critic_fc2(critic_value))
-        critic_value = self.critic_out(critic_value)
+            x = x.view(x.size(0), -1)
+            x = F.relu(self.fc1(x))
+
+            actor_mean = F.relu(self.actor_fc1(x))
+            actor_mean = F.relu(self.actor_fc2(actor_mean))
+            actor_mean = self.actor_out(actor_mean)
+
+            critic_value = F.relu(self.critic_fc1(x))
+            critic_value = F.relu(self.critic_fc2(critic_value))
+            critic_value = self.critic_out(critic_value)
 
         return actor_mean, critic_value
 
@@ -221,13 +267,22 @@ class PPO_Conv_Agent(nn.Module):
     def get_flat_params(self, *modules):
         params = []
         for module in modules:
-            params.append(torch.cat([p.flatten() for p in module.parameters()]))
+            params.append(torch.cat([p.flatten().clone() for p in module.parameters()]))
         return torch.cat(params)
     # def get_flat_params(self):
         
     #     self.init_params_dict = {}
     #     for name, param in self.named_parameters():
     #         self.init_params_dict[name] = param.data.clone().detach()
+    def compute_l2_0_loss(self):
+        l2_0_loss = 0.0
+        for name, param in self.named_parameters():
+            if not param.requires_grad or 'layer_norm' in name or \
+                'init_params' in name or \
+                    'original_last_layer_params' in name:
+                continue
+            l2_0_loss += torch.sum(param ** 2)
+        return 0.5 * l2_0_loss
 
     def compute_l2_loss(self, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
         curr_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
@@ -258,6 +313,43 @@ class PPO_Conv_Agent(nn.Module):
             parseval_loss += torch.norm(W @ W.T - s * identity, p='fro') ** 2
 
         return lambda_parseval * parseval_loss
+
+    def compute_fisher_information(self, sampled_obs, sampled_actions):
+        fisher_accumulated = {name: torch.zeros_like(param) for name, param in self.named_parameters() if param.requires_grad}
+        for obs, action in zip(sampled_obs, sampled_actions):
+            self.zero_grad()
+            _, log_prob, _, _ = self.get_action_and_value(obs.unsqueeze(0), action.unsqueeze(0))
+            log_prob.backward()
+
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    fisher_accumulated[name] += (param.grad.data ** 2).clone()
+        # Normalize by the number of samples
+        for name in fisher_accumulated:
+            fisher_accumulated[name] /= len(sampled_obs)
+        for name, fisher_value in fisher_accumulated.items():
+            if name not in self.fisher_information:
+                self.fisher_information[name] = fisher_value
+            else:
+                self.fisher_information[name] += fisher_value
+
+    def reset_fisher_information(self):
+        """Resets fisher info to start fresh for a new task."""
+        self.fisher_information = {name: torch.zeros_like(param) 
+                                   for name, param in self.named_parameters()}
+
+    def store_optimal_weights(self):
+        self.optimal_weights = {
+            name: param.data.clone() for name, param in self.named_parameters()
+        }
+
+    def ewc_loss(self):
+        ewc_loss = 0
+        for name, param in self.named_parameters():
+            if name in self.fisher_information:
+                ewc_loss += (self.fisher_information[name] *
+                             (param - self.optimal_weights[name]) ** 2).sum()
+        return ewc_loss
 
 import torch, math
 
