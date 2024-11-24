@@ -14,6 +14,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent, WeightClipping
 from pathlib import Path
+from collections import namedtuple
 
 class RUNNINGSTATISTICS:
     def __init__(self):
@@ -372,7 +373,30 @@ if __name__ == "__main__":
     value_STD = 1.0 
     alpha = 0.001
 
-    ewc_buffer={'obs': [], 'actions': []}
+    transition = namedtuple('Transition', ('obs', 'action'))
+    class ewc_buffer:
+        def __init__(self, buffer_size=100000):
+            self.buffer_size = buffer_size  
+            self.location = 0 
+            self.buffer = []
+
+        def add(self, obs, action):
+            if len(self.buffer) < self.buffer_size:
+                self.buffer.append(transition(obs, action))
+            else:
+                self.buffer[self.location] = transition(obs, action)
+            self.location = (self.location + 1) % self.buffer_size
+
+        def sample(self, batch_size):
+            return random.sample(self.buffer, batch_size)
+
+        def size(self):
+            return len(self.buffer)
+
+        def clear(self):
+            self.buffer = []
+            self.location = 0
+    ewc_buffer = ewc_buffer(buffer_size=100000)
     
     for i,envs in enumerate(train_envs):
         print(f"Training on environment: {args.env_ids[i]}")
@@ -580,8 +604,8 @@ if __name__ == "__main__":
                     mb_inds = b_inds[start:end]
                     _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                     if args.use_ewc:
-                        ewc_buffer['obs'].append(b_obs[mb_inds].detach().clone())
-                        ewc_buffer['actions'].append(b_actions[mb_inds].detach().clone())
+                        for mb_ind in mb_inds:
+                            ewc_buffer.add(b_obs[mb_ind].detach().clone(), b_actions[mb_ind].detach().clone())
                     writer.add_scalar("losses/training_newvalue_raw", newvalue.mean().item(), global_step)
                     # if args.value_norm: TODO: scale newvalue or not
                     #     newvalue = newvalue * value_STD + value_MU
@@ -642,10 +666,13 @@ if __name__ == "__main__":
                         l2_0_loss = agent.compute_l2_0_loss()
                         loss += args.l2_coef * l2_0_loss
                         writer.add_scalar(f"train/l2_0_loss", l2_0_loss, global_step)
-                    if args.use_ewc and i>0:
-                        ewc_loss = agent.ewc_loss()
-                        loss += args.ewc_coef * ewc_loss
-                        writer.add_scalar(f"train/ewc_loss", ewc_loss.item(), global_step)
+                    if args.use_ewc:
+                        if i>0:
+                            ewc_loss = agent.ewc_loss()
+                            loss += args.ewc_coef * ewc_loss
+                            writer.add_scalar(f"train/ewc_loss", ewc_loss.item(), global_step)
+                        else:
+                            writer.add_scalar(f"train/ewc_loss", 0, global_step)
                     writer.add_scalar(f"train/total_loss", loss, global_step)
 
                     optimizer.zero_grad()
@@ -677,17 +704,13 @@ if __name__ == "__main__":
             writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         if args.use_ewc:
             agent.reset_fisher_information()
-            ewc_obs = torch.cat(ewc_buffer['obs'], dim=0)
-            ewc_actions = torch.cat(ewc_buffer['actions'], dim=0)
-            
-            num_samples = min(10000, ewc_obs.size(0))
-            sampled_indices = torch.randint(0, ewc_obs.size(0), (num_samples,))
-            sampled_obs = ewc_obs[sampled_indices]
-            sampled_actions = ewc_actions[sampled_indices]
+            sampled = ewc_buffer.sample(batch_size=10000)
+            sampled_obs = torch.stack([t.obs for t in sampled])
+            sampled_actions = torch.stack([t.action for t in sampled])
             #fisher-info matrix
 
             agent.compute_fisher_information(sampled_obs, sampled_actions)
-            ewc_buffer = {'obs': [], 'actions': []}
+            ewc_buffer.clear()
             agent.store_optimal_weights()
         envs.close()
     writer.close()
