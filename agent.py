@@ -304,7 +304,7 @@ class PPO_Conv_Agent(nn.Module):
         #         l2_loss += torch.sum(diff ** 2)
         # return 0.5 * l2_loss
 
-    def parseval_regularization(self,s,lambda_parseval=0.01):
+    def parseval_regularization(self,s=2):
         parseval_loss = 0.0
 
         for layer in [self.fc1,self.actor_fc1, self.actor_fc2,self.critic_fc1, self.critic_fc2]:
@@ -312,7 +312,7 @@ class PPO_Conv_Agent(nn.Module):
             identity = torch.eye(W.size(0), device=W.device)
             parseval_loss += torch.norm(W @ W.T - s * identity, p='fro') ** 2
 
-        return lambda_parseval * parseval_loss
+        return parseval_loss
 
     def compute_fisher_information(self, sampled_obs, sampled_actions):
         fisher_accumulated = {name: torch.zeros_like(param) for name, param in self.named_parameters() if param.requires_grad}

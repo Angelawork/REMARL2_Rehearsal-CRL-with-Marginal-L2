@@ -179,6 +179,10 @@ class Args:
     """Toggle for the usage of EWC loss"""
     ewc_coef: float = 1.0
 
+    use_parseval_reg: bool = False
+    """Toggle for the usage of parseval regularization loss"""
+    parseval_coef: float = 0.01
+
     use_l2_loss: bool = False
     """Toggle for the usage of L2 init loss"""
     use_l2_0_loss: bool = False
@@ -673,6 +677,10 @@ if __name__ == "__main__":
                             writer.add_scalar(f"train/ewc_loss", ewc_loss.item(), global_step)
                         else:
                             writer.add_scalar(f"train/ewc_loss", 0, global_step)
+                    if args.use_parseval_reg:
+                        parseval_loss = agent.parseval_regularization()
+                        loss += args.parseval_coef * parseval_loss
+                        writer.add_scalar(f"train/parseval_loss", parseval_loss.item(), global_step)
                     writer.add_scalar(f"train/total_loss", loss, global_step)
 
                     optimizer.zero_grad()
