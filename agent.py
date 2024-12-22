@@ -1,11 +1,20 @@
 from dataclasses import dataclass
 import numpy as np
-import torch
+import torch, math
 import random
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 import torch.nn.functional as F
+
+class DiagonalLayer(nn.Module):
+    def __init__(self, size):
+        super(DiagonalLayer, self).__init__()
+        self.scale = nn.Parameter(torch.ones(size))
+        self.bias = nn.Parameter(torch.zeros(size))
+
+    def forward(self, x):
+        return x * self.scale + self.bias
 
 class CReLU(nn.Module):
     def __init__(self):
@@ -174,9 +183,11 @@ class PPO_metaworld_Agent(nn.Module):
         return action, log_prob_sum, entropy_sum, self.critic(x).unsqueeze(0)
 
 class PPO_Conv_Agent(nn.Module):
-    def __init__(self, envs, hidden_size=64, seed=None, use_crelu=False):
+    def __init__(self, envs, hidden_size=64, seed=None, use_crelu=False, use_DiagonalLayer=False, use_inputScaling=False):
         super(PPO_Conv_Agent, self).__init__()
         self.use_crelu = use_crelu
+        self.use_DiagonalLayer= use_DiagonalLayer
+        self.use_inputScaling=use_inputScaling
         if seed is not None:
             torch.manual_seed(seed)
         if use_crelu:
@@ -206,8 +217,23 @@ class PPO_Conv_Agent(nn.Module):
             self.critic_fc2 = nn.Linear(hidden_size, hidden_size)
             self.critic_out = nn.Linear(hidden_size, 1)
 
+        if use_DiagonalLayer:
+            self.diagonal_fc1 = DiagonalLayer(hidden_size)
+            self.diagonal_actor_fc1 = DiagonalLayer(hidden_size)
+            self.diagonal_actor_fc2 = DiagonalLayer(hidden_size)
+            self.diagonal_critic_fc1 = DiagonalLayer(hidden_size)
+            self.diagonal_critic_fc2 = DiagonalLayer(hidden_size)
+        if use_inputScaling:
+            self.input_scale = nn.Parameter(torch.ones(1))
+
         self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
         self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        self.current_critic_target = self.init_critic_params
+        self.current_actor_target = self.init_actor_params
+
+        self.critic_param_candidates = self.sample_initial_candidates(100, self.critic_fc1, self.critic_fc2, self.critic_out)
+        self.actor_param_candidates = self.sample_initial_candidates(100, self.actor_fc1, self.actor_fc2, self.actor_out)
+        self.distance_metric = 'l2'
         # self.init_params_dict = {}
         # for name, param in self.named_parameters():
         #     self.init_params_dict[name] = param.data.clone().detach()
@@ -215,12 +241,56 @@ class PPO_Conv_Agent(nn.Module):
         self.fisher_information = {}
         self.optimal_weights = {}
 
+    def sample_initial_candidates(self, num_samples, *modules):
+        candidates = []
+        initial_params = self.get_flat_params(*modules).detach()
+        for _ in range(num_samples):
+            candidates.append(initial_params * (1 + torch.randn_like(initial_params) * 0.01))
+        return candidates
+
+    def compute_distance(self, params1, params2, metric='l2'):
+        device = params1.device
+        params2 = params2.to(device)
+        if metric == 'l2':
+            return torch.norm(params1 - params2).item()
+        elif metric == 'cosine':
+            return 1 - torch.nn.functional.cosine_similarity(params1, params2, dim=0).item()
+
+    def set_distance_metric(self, metric):
+        if metric not in ['l2', 'cosine']:
+            raise ValueError("Unsupported metric!")
+        self.distance_metric = metric
+    
+    def set_l2_target(self):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        current_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach().to(device)
+        current_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach().to(device)
+
+        critic_distances = [
+            self.compute_distance(current_critic_params, candidate, metric=self.distance_metric)
+            for candidate in self.critic_param_candidates
+        ]
+        actor_distances = [
+            self.compute_distance(current_actor_params, candidate, metric=self.distance_metric)
+            for candidate in self.actor_param_candidates
+        ]
+
+        min_critic_dist=min(critic_distances)
+        min_actor_dist=min(actor_distances)
+        self.current_critic_target = self.critic_param_candidates[critic_distances.index(min_critic_dist)].to(device)
+        self.current_actor_target = self.actor_param_candidates[actor_distances.index(min_actor_dist)].to(device)
+        return min_critic_dist, min_actor_dist
+
     def set_flat_params(self):
-        # self.get_flat_params()
         self.init_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out).detach()
         self.init_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
+        self.current_critic_target = self.init_critic_params
+        self.current_actor_target = self.init_actor_params
 
     def forward(self, x):
+        if self.use_inputScaling:
+            x = x * self.input_scale
+
         if self.use_crelu:
             x = self.conv_activation_fn(self.conv(x))
             x = self.pool(x)
@@ -233,6 +303,20 @@ class PPO_Conv_Agent(nn.Module):
 
             critic_value = self.fc_activation_fn(self.critic_fc1(x))
             critic_value = self.fc_activation_fn(self.critic_fc2(critic_value))
+            critic_value = self.critic_out(critic_value)
+        if self.use_DiagonalLayer:
+            x = F.relu(self.conv(x))
+            x = self.pool(x)
+
+            x = x.view(x.size(0), -1)
+            x = self.diagonal_fc1(F.relu(self.fc1(x)))
+
+            actor_mean = self.diagonal_actor_fc2(F.relu(self.actor_fc2(
+                            self.diagonal_actor_fc1(F.relu(self.actor_fc1(x))))))
+            actor_mean = self.actor_out(actor_mean)
+
+            critic_value = self.diagonal_critic_fc2(F.relu(self.critic_fc2(
+                            self.diagonal_critic_fc1(F.relu(self.critic_fc1(x))))))
             critic_value = self.critic_out(critic_value)
         else:
             x = F.relu(self.conv(x))
@@ -288,8 +372,8 @@ class PPO_Conv_Agent(nn.Module):
         curr_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
         curr_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach()
 
-        l2_loss_critic = 0.5 * ((curr_critic_params - self.init_critic_params.to(device)) ** 2).sum()
-        l2_loss_actor = 0.5 * ((curr_actor_params - self.init_actor_params.to(device)) ** 2).sum()
+        l2_loss_critic = 0.5 * ((curr_critic_params - self.current_critic_target.to(device)) ** 2).sum()
+        l2_loss_actor = 0.5 * ((curr_actor_params - self.current_actor_target.to(device)) ** 2).sum()
 
         l2_loss = l2_loss_critic + l2_loss_actor
         
@@ -351,7 +435,6 @@ class PPO_Conv_Agent(nn.Module):
                              (param - self.optimal_weights[name]) ** 2).sum()
         return ewc_loss
 
-import torch, math
 
 class InitBounds:
     '''

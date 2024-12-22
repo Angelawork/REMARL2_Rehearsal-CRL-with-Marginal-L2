@@ -182,6 +182,8 @@ class Args:
     use_parseval_reg: bool = False
     """Toggle for the usage of parseval regularization loss"""
     parseval_coef: float = 0.01
+    use_DiagonalLayer: bool = False
+    use_inputScaling: bool = False
 
     use_l2_loss: bool = False
     """Toggle for the usage of L2 init loss"""
@@ -191,6 +193,8 @@ class Args:
     """ l2 init loss's coefficient"""
     periodic_l2: bool = False
     """Toggle for the usage of L2 init loss on every parameter: theta_t-1 instead of paramater at theta_0"""
+    candidate_l2: bool = False
+    candidate_metric: str = "l2"
    
     wandb_log_off: bool = True
     """Toggle true for turning off wandb log files"""
@@ -406,7 +410,7 @@ if __name__ == "__main__":
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
             if args.exp_type == "ppo_minatar":
-                agent=PPO_Conv_Agent(envs=envs,seed=args.seed,use_crelu=args.use_crelu).to(device)
+                agent=PPO_Conv_Agent(envs=envs,seed=args.seed,use_crelu=args.use_crelu, use_DiagonalLayer=args.use_DiagonalLayer, use_inputScaling=args.use_inputScaling).to(device)
             elif args.exp_type == "ppo_metaworld":
                 agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
@@ -428,6 +432,12 @@ if __name__ == "__main__":
         else:
             if args.periodic_l2 and args.use_l2_loss:
                 agent.set_flat_params()
+        
+        if args.candidate_l2 and args.use_l2_loss:
+            agent.set_distance_metric(args.candidate_metric)
+            min_critic_dist, min_actor_dist = agent.set_l2_target()
+            writer.add_scalar(f"train/min_critic_dist", min_critic_dist, global_step)
+            writer.add_scalar(f"train/min_actor_dist", min_actor_dist, global_step)
 
         # TRY NOT TO MODIFY: start the game
         next_obs, _ = envs.reset(seed=args.seed)
