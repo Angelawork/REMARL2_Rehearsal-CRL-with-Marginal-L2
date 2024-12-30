@@ -16,6 +16,29 @@ from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent, Weight
 from pathlib import Path
 from collections import namedtuple
 
+class TDErrorScaler:
+    def __init__(self):
+        self.n = 0
+        self.mean_r = 0.0
+        self.var_r = 0.0
+        self.mean_g2 = 0.0
+        self.var_g2 = 0.0
+    
+    def update(self, reward, discount, cumulative_return):
+        self.n += 1
+        delta = reward - self.mean_r
+        self.mean_r += delta / self.n
+        self.var_r += delta * (reward - self.mean_r)
+        
+        delta_g = cumulative_return - self.mean_g2
+        self.mean_g2 += delta_g / self.n
+        self.var_g2 += delta_g * (cumulative_return - self.mean_g2)
+        
+    def get_scaled_td_error(self, td_error):
+        var_delta = self.var_r / max(self.n, 1) + self.mean_g2 * (self.var_r / max(self.n, 1))
+        std_delta = (var_delta + 1e-6) ** 0.5
+        return td_error / std_delta
+
 class RUNNINGSTATISTICS:
     def __init__(self):
         self.count = 0
@@ -171,6 +194,11 @@ class Args:
     """Weight Clipping"""
     clip_last_layer: int = 1
     """Clip the last layer of the network"""
+    
+    use_tderror: bool = False
+    """Toggle for the usage of TD Error Scaler"""
+    global_tderror: bool = False
+    """Toggle true for turning on global TD Error Scaler"""
 
     use_crelu: bool = False
     """Toggle for the usage of Concat ReLU"""
@@ -381,6 +409,9 @@ if __name__ == "__main__":
     value_STD = 1.0 
     alpha = 0.001
 
+    if args.use_tderror:
+        td_scaler = TDErrorScaler()
+
     transition = namedtuple('Transition', ('obs', 'action'))
     class ewc_buffer:
         def __init__(self, buffer_size=100000):
@@ -456,6 +487,9 @@ if __name__ == "__main__":
             reward_statistics = RUNNINGSTATISTICS()
             R_t_1 = 0.0
             rew_P=0.0
+
+        if args.use_tderror and not args.global_tderror:
+            td_scaler = TDErrorScaler()
         
         for iteration in range(1, args.num_iterations + 1):
             # Annealing the rate if instructed to do so.
@@ -654,8 +688,27 @@ if __name__ == "__main__":
                         writer.add_scalar("losses/b_returns[mb_inds]_normalized", b_returns[mb_inds].mean().item(), global_step)
                     
                     newvalue = newvalue.view(-1)
+
+                    if args.use_tderror:
+                        td_error = b_returns[mb_inds] - newvalue.view(-1)
+                        cumulative_return = b_returns[mb_inds].detach().clone()
+                        #update scaler with minibatch data
+                        for idx in range(len(td_error)):
+                            td_scaler.update(
+                                reward=b_returns[mb_inds][idx].item(),
+                                discount=args.gamma,
+                                cumulative_return=cumulative_return[idx].item()
+                            )
+                        scaled_td_error = td_scaler.get_scaled_td_error(td_error)
+                        wandb.log({"td_error/td_mean": td_error.mean().item()}, step=global_step)
+                        wandb.log({"td_error/scaled_td_mean": scaled_td_error.mean().item()}, step=global_step)
+
+
                     if args.clip_vloss:
-                        v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                        if args.use_tderror:
+                            v_loss_unclipped = (scaled_td_error) ** 2
+                        else:
+                            v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                         v_clipped = b_values[mb_inds] + torch.clamp(
                             newvalue - b_values[mb_inds],
                             -args.clip_coef,
@@ -665,7 +718,10 @@ if __name__ == "__main__":
                         v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                         v_loss = 0.5 * v_loss_max.mean()
                     else:
-                        v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                        if args.use_tderror:
+                            v_loss = 0.5 * (scaled_td_error ** 2).mean()
+                        else:
+                            v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                     entropy_loss = entropy.mean()
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
