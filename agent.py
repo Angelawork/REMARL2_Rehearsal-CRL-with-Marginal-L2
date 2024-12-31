@@ -6,6 +6,10 @@ import torch.nn as nn
 from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 import torch.nn.functional as F
+import copy
+from copy import deepcopy
+from typing import List, Dict, Optional
+import torch.distributions as dist
 
 class DiagonalLayer(nn.Module):
     def __init__(self, size):
@@ -231,33 +235,57 @@ class PPO_Conv_Agent(nn.Module):
         self.current_critic_target = self.init_critic_params
         self.current_actor_target = self.init_actor_params
 
-        self.critic_param_candidates = self.sample_initial_candidates(100, self.critic_fc1, self.critic_fc2, self.critic_out)
-        self.actor_param_candidates = self.sample_initial_candidates(100, self.actor_fc1, self.actor_fc2, self.actor_out)
-        self.distance_metric = 'l2'
+        self.critic_param_candidates = self.sample_initial_candidates(100, mode="critic")
+        self.actor_param_candidates = self.sample_initial_candidates(100, mode="actor")
+        self.distance_metric = "l2"
         # self.init_params_dict = {}
         # for name, param in self.named_parameters():
         #     self.init_params_dict[name] = param.data.clone().detach()
 
         self.fisher_information = {}
         self.optimal_weights = {}
+        
+    def reset_parameters(self):
+        for layer in self.modules():
+            if isinstance(layer, (nn.Linear, nn.Conv2d)):
+                layer.reset_parameters()
 
-    def sample_initial_candidates(self, num_samples, *modules):
+    def sample_initial_candidates(self, num_samples, mode="critic"):
         candidates = []
-        initial_params = self.get_flat_params(*modules).detach()
         for _ in range(num_samples):
-            candidates.append(initial_params * (1 + torch.randn_like(initial_params) * 0.01))
+            model = copy.deepcopy(self)
+            model.reset_parameters()
+                # if param.requires_grad:
+                    # if mode in name:
+                    #     if param.dim() > 1:
+                    #         nn.init.xavier_uniform_(param)
+                    #     else:
+                    #         nn.init.zeros_(param)
+                    #                 if param.requires_grad and mode in name:
+                    # if param.dim() > 1:
+                    #     nn.init.kaiming_uniform_(param, a=math.sqrt(5))
+                    # else:
+                    #     fan_in, _ = nn.init._calculate_fan_in_and_fan_out(param)
+                    #     bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    #     nn.init.uniform_(param, -bound, bound)
+            if mode == "critic":
+                candidates.append(self.get_flat_params(
+                    model.critic_fc1, model.critic_fc2, model.critic_out).detach())
+            elif mode == "actor":
+                candidates.append(self.get_flat_params(
+                    model.actor_fc1, model.actor_fc2, model.actor_out).detach())
         return candidates
 
-    def compute_distance(self, params1, params2, metric='l2'):
+    def compute_distance(self, params1, params2, metric="l2"):
         device = params1.device
         params2 = params2.to(device)
-        if metric == 'l2':
+        if metric == "l2":
             return torch.norm(params1 - params2).item()
-        elif metric == 'cosine':
+        elif metric == "cosine":
             return 1 - torch.nn.functional.cosine_similarity(params1, params2, dim=0).item()
 
     def set_distance_metric(self, metric):
-        if metric not in ['l2', 'cosine']:
+        if metric not in ["l2", "cosine"]:
             raise ValueError("Unsupported metric!")
         self.distance_metric = metric
     
@@ -267,12 +295,12 @@ class PPO_Conv_Agent(nn.Module):
         current_actor_params = self.get_flat_params(self.actor_fc1, self.actor_fc2, self.actor_out).detach().to(device)
 
         critic_distances = [
-            self.compute_distance(current_critic_params, candidate, metric=self.distance_metric)
-            for candidate in self.critic_param_candidates
+            self.compute_distance(current_critic_params, c, metric=self.distance_metric)
+            for c in self.critic_param_candidates
         ]
         actor_distances = [
-            self.compute_distance(current_actor_params, candidate, metric=self.distance_metric)
-            for candidate in self.actor_param_candidates
+            self.compute_distance(current_actor_params, c, metric=self.distance_metric)
+            for c in self.actor_param_candidates
         ]
 
         min_critic_dist=min(critic_distances)
@@ -361,9 +389,9 @@ class PPO_Conv_Agent(nn.Module):
     def compute_l2_0_loss(self):
         l2_0_loss = 0.0
         for name, param in self.named_parameters():
-            if not param.requires_grad or 'layer_norm' in name or \
-                'init_params' in name or \
-                    'original_last_layer_params' in name:
+            if not param.requires_grad or "layer_norm" in name or \
+                "init_params" in name or \
+                    "original_last_layer_params" in name:
                 continue
             l2_0_loss += torch.sum(param ** 2)
         return 0.5 * l2_0_loss
@@ -394,7 +422,7 @@ class PPO_Conv_Agent(nn.Module):
         for layer in [self.fc1,self.actor_fc1, self.actor_fc2,self.critic_fc1, self.critic_fc2]:
             W = layer.weight
             identity = torch.eye(W.size(0), device=W.device)
-            parseval_loss += torch.norm(W @ W.T - s * identity, p='fro') ** 2
+            parseval_loss += torch.norm(W @ W.T - s * identity, p="fro") ** 2
 
         return parseval_loss
 
@@ -435,6 +463,294 @@ class PPO_Conv_Agent(nn.Module):
                              (param - self.optimal_weights[name]) ** 2).sum()
         return ewc_loss
 
+
+# class PackNet_PPO_Conv_Agent(PPO_Conv_Agent):
+#     def __init__(self, envs, prune_perc=0.5, retrain_steps=10000, *args, **kwargs):
+#         super().__init__(envs, *args, **kwargs)
+#         self.prune_perc = prune_perc
+#         self.retrain_steps = retrain_steps
+#         self.current_task_idx = 0
+
+#         self.saved_masks = {}
+#         self.saved_weights = {}
+
+#     def save_masks_and_weights(self):
+#         self.saved_masks = {}
+#         self.saved_weights = {}
+#         for name, param in self.named_parameters():
+#             if "weight" in name and param.requires_grad:
+#                 mask = (param != 0).float()
+#                 self.saved_masks[name] = mask
+#                 self.saved_weights[name] = param.clone().detach()
+
+#     def apply_mask(self):
+#         for name, param in self.named_parameters():
+#             if name in self.saved_masks:
+#                 mask = self.saved_masks[name]
+#                 param.data *= mask
+
+#     def prune_weights(self):
+#         for name, param in self.named_parameters():
+#             if "weight" in name and param.requires_grad:
+#                 abs_param = torch.abs(param)
+#                 threshold = torch.quantile(abs_param, self.prune_perc)
+#                 mask = (abs_param > threshold).float()
+#                 param.data *= mask
+#                 self.saved_masks[name] = mask
+
+#     def retrain_after_pruning(self, optimizer, train_data_loader):
+#         for _ in range(self.retrain_steps):
+#             for batch in train_data_loader:
+#                 observations, actions, log_probs, returns = batch
+#                 optimizer.zero_grad()
+#                 loss = self.compute_loss(observations, actions, log_probs, returns)
+#                 loss.backward()
+#                 self.apply_mask()
+#                 optimizer.step()
+
+#     def compute_loss(self, observations, actions, log_probs, returns):
+#         _, new_log_probs, _, values = self.get_action_and_value(observations, actions)
+#         advantages = returns - values.flatten()
+#         pg_loss = -torch.mean(advantages * torch.exp(new_log_probs - log_probs))
+#         value_loss = torch.mean((values.flatten() - returns) ** 2)
+#         entropy_loss = torch.mean(-new_log_probs)
+#         return pg_loss + value_loss - entropy_loss
+
+#     def train_with_packnet(self, optimizer, observations, actions, log_probs, returns, train_data_loader):
+#         self.retrain_after_pruning(optimizer, train_data_loader)
+#         self.save_masks_and_weights()
+
+#     def on_task_end(self):
+#         self.prune_weights()
+#         self.current_task_idx += 1
+
+class PPO_Conv_Agent_VCL(nn.Module):
+    def __init__(self, envs, hidden_size=64, cl_reg_coef=1, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+        super().__init__()
+        input_channels = envs.single_observation_space.shape[0]
+        num_actions = envs.single_action_space.n
+
+        self.conv = nn.Conv2d(input_channels, 32, kernel_size=2)
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+
+        self.fc1 = BayesianLayer(512, hidden_size)
+        self.actor_fc1 = BayesianLayer(hidden_size, hidden_size)
+        self.actor_out = BayesianLayer(hidden_size, num_actions)
+        self.critic_fc1 = BayesianLayer(hidden_size, hidden_size)
+        self.critic_out = BayesianLayer(hidden_size, 1)
+
+        self.cl_reg_coef = cl_reg_coef
+
+    def forward(self, x):
+        x = F.relu(self.conv(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+
+        actor_mean = F.relu(self.actor_fc1(x))
+        actor_mean = self.actor_out(actor_mean)
+
+        critic_value = F.relu(self.critic_fc1(x))
+        critic_value = self.critic_out(critic_value)
+
+        return actor_mean, critic_value
+        
+    def get_value(self, x):
+        _, value = self.forward(x)
+        return value
+        
+    def get_action_and_value(self, x, action=None):
+        logits, value = self.forward(x)
+        probs = Categorical(logits=logits)
+
+        if action is None:
+            action = probs.sample()
+
+        return action, probs.log_prob(action), probs.entropy(), value
+
+    def compute_kl_loss(self):
+        kl_loss = (
+            self.fc1.kl_divergence() +
+            self.actor_fc1.kl_divergence() +
+            self.actor_out.kl_divergence() +
+            self.critic_fc1.kl_divergence() +
+            self.critic_out.kl_divergence()
+        )
+        return self.cl_reg_coef * kl_loss
+
+    def update_priors(self):
+        self.fc1.update_prior()
+        self.actor_fc1.update_prior()
+        self.actor_out.update_prior()
+        self.critic_fc1.update_prior()
+        self.critic_out.update_prior()
+
+class BayesianLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, init_logvar=-6.0):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        self.posterior_mean = nn.Parameter(torch.zeros(input_dim, output_dim))
+        self.posterior_logvar = nn.Parameter(torch.full((input_dim, output_dim), init_logvar))
+
+        self.prior_mean = torch.zeros(input_dim, output_dim, requires_grad=False)
+        self.prior_logvar = torch.full((input_dim, output_dim), init_logvar, requires_grad=False)
+
+    def forward(self, x):
+        eps = torch.randn_like(self.posterior_mean)
+        weights = self.posterior_mean + eps * torch.exp(0.5 * self.posterior_logvar)
+        return x @ weights
+
+    def update_prior(self):
+        with torch.no_grad():
+            self.prior_mean.copy_(self.posterior_mean)
+            self.prior_logvar.copy_(self.posterior_logvar)
+
+    def kl_divergence(self, device= torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+        posterior_var = torch.exp(self.posterior_logvar)
+        prior_var = torch.exp(self.prior_logvar)
+
+        prior_var = prior_var.to(device)
+        posterior_var = posterior_var.to(device)
+        self.posterior_mean = self.posterior_mean.to(device)
+        self.prior_mean = self.prior_mean.to(device)
+        
+        kl = 0.5 * (torch.log(prior_var) - torch.log(posterior_var) +
+                    (posterior_var + (self.posterior_mean - self.prior_mean)**2) / prior_var - 1)
+        return kl.sum()
+
+
+class PackNet(nn.Module):
+    def __init__(self, model, task_id, total_task_num):
+        super().__init__()
+        device="cuda" if torch.cuda.is_available() else "cpu"
+        self.model = model
+        self.task_id = task_id
+        self.total_task_num = total_task_num
+        self.prune_percentage = 1 / total_task_num
+
+        self.masks = []
+        for name, param in self.model.named_parameters():
+            if name.endswith(".weight"):
+                self.masks.append(
+                    torch.zeros(param.size(), dtype=torch.long, device=device)
+                )
+            else:
+                self.masks.append(None)
+        self.view = None
+        self.handled_layers = (
+            []
+        )
+
+    @torch.no_grad()
+    def adjust_gradients(self, retrain_mode=False):
+        mask_id = self.task_id if retrain_mode else 0
+        for p, mask in zip(self.model.parameters(), self.masks):
+            if mask is None:
+                continue
+            p.grad = p.grad * (mask == mask_id)
+
+    @torch.no_grad()
+    def prune(self):
+        for p, mask in zip(self.model.parameters(), self.masks):
+            if mask is not None:
+                # sort the unassigned weights from lower to higher magnitudes
+                masked = p * (mask == 0)  # only select "free" weights
+                flat = masked.flatten()
+                _sorted, indices = torch.sort(
+                    flat.abs(), descending=True
+                )  # sort from max to min magnitude
+                n_prune = int(
+                    self.prune_percentage * flat.size(0)
+                )  # number of weights to keep in pruning
+
+                # create the mask
+                mask.flatten()[indices[:n_prune]] = self.task_id
+
+    @torch.no_grad()
+    def apply_mask(self):
+        for param, mask in zip(self.model.parameters(), self.masks):
+            if mask is not None:
+                param.data *= mask.float()
+
+    @torch.no_grad()
+    def set_view(self, task_id):
+        if task_id is None and self.view is not None:
+            # restore the original state of the model in the free parameters (not masked)
+            for param_copy, param, mask in zip(
+                self.handled_layers, self.model.parameters(), self.masks
+            ):
+                if param_copy is None:
+                    continue
+                m = torch.logical_and(
+                    mask <= self.view, mask > 0
+                )  # pruned=0, not-pruned=1
+                param.data += param_copy.data * torch.logical_not(m)
+
+            self.handled_layers = []
+            self.view = task_id
+            return
+
+        if len(self.handled_layers) == 0:
+            # save a copy of each (parametrized) layer of the model
+            for param, mask in zip(self.model.parameters(), self.masks):
+                if mask is not None:
+                    self.handled_layers.append(copy.deepcopy(param))
+                else:
+                    self.handled_layers.append(None)
+
+        # apply the masks
+        for p, mask in zip(self.model.parameters(), self.masks):
+            if mask is None:
+                continue
+            # set to zero the parameters that are free (have no mask) or whose mask ID is greater than task_id
+            p.data *= torch.logical_and(mask <= task_id, mask > 0)
+
+        self.view = task_id
+
+    def forward(self, x):
+        return self.model(x)
+
+class PPO_PackNet_Agent(nn.Module):
+    def __init__(self, envs, task_id=1, total_task_num=5,seed=None):
+        super().__init__()
+        self.model=PPO_Conv_Agent(envs=envs,seed=seed)
+        self.packnet = PackNet(model=self.model, task_id=task_id, total_task_num=total_task_num)
+        self.retrain_mode = False
+
+    def get_value(self, x):
+        return self.model.get_value(x)
+
+    def get_action_and_value(self, x, action=None):
+        return self.model.get_action_and_value(x, action)
+
+    def prune(self):
+        self.packnet.prune()
+
+    def apply_mask(self):
+        self.packnet.apply_mask()
+
+    def set_view(self, task_id):
+        self.packnet.set_view(task_id)
+
+    def forward(self, x):
+        return self.packnet(x)
+    
+    def start_retraining(self):
+        if self.retrain_mode:
+            return  # nothing to do
+
+        print("==> PackNet re-training starts!")
+
+        self.retrain_mode = True
+        self.packnet.prune()  # generate the masks for the current task
+        self.packnet.set_view(self.packnet.task_id)
+
+    def before_update(self):
+        self.packnet.adjust_gradients(retrain_mode=self.retrain_mode)
 
 class InitBounds:
     '''

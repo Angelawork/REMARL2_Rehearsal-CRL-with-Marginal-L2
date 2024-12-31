@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent, WeightClipping
+from agent import PPO_minatar_Agent, PPO_metaworld_Agent, PPO_Conv_Agent, WeightClipping, PPO_Conv_Agent_VCL, PPO_PackNet_Agent
 from pathlib import Path
 from collections import namedtuple
 
@@ -195,6 +195,9 @@ class Args:
     clip_last_layer: int = 1
     """Clip the last layer of the network"""
     
+    use_vcl: bool = False
+    use_packnet: bool = False
+
     use_tderror: bool = False
     """Toggle for the usage of TD Error Scaler"""
     global_tderror: bool = False
@@ -442,6 +445,12 @@ if __name__ == "__main__":
         if i==0:
             if args.exp_type == "ppo_minatar":
                 agent=PPO_Conv_Agent(envs=envs,seed=args.seed,use_crelu=args.use_crelu, use_DiagonalLayer=args.use_DiagonalLayer, use_inputScaling=args.use_inputScaling).to(device)
+                if args.use_vcl:
+                    agent=PPO_Conv_Agent_VCL(envs=envs,seed=args.seed).to(device)
+                if args.use_packnet:
+                    packnet_retrain_start = args.total_timesteps - int(args.total_timesteps * 0.2)
+
+                    agent=PPO_PackNet_Agent(envs=envs,seed=args.seed).to(device)
             elif args.exp_type == "ppo_metaworld":
                 agent = PPO_metaworld_Agent(envs=envs,seed=args.seed).to(device)
 
@@ -747,11 +756,20 @@ if __name__ == "__main__":
                         parseval_loss = agent.parseval_regularization()
                         loss += args.parseval_coef * parseval_loss
                         writer.add_scalar(f"train/parseval_loss", parseval_loss.item(), global_step)
+                    if args.use_vcl:
+                        kl_loss = agent.compute_kl_loss()
+                        loss += kl_loss
+                        writer.add_scalar("train/kl_loss", kl_loss.item(), global_step)
+
                     writer.add_scalar(f"train/total_loss", loss, global_step)
 
                     optimizer.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                    if args.use_packnet:
+                        if global_step >= packnet_retrain_start:
+                            agent.start_retraining()  # can be called multiple times, only the first counts
+                        agent.before_update()
                     optimizer.step()
 
                 if args.target_kl is not None and approx_kl > args.target_kl:
@@ -786,5 +804,8 @@ if __name__ == "__main__":
             agent.compute_fisher_information(sampled_obs, sampled_actions)
             ewc_buffer.clear()
             agent.store_optimal_weights()
+        if args.use_vcl:
+            agent.update_priors()
+        
         envs.close()
     writer.close()
