@@ -195,6 +195,8 @@ class Args:
     clip_last_layer: int = 1
     """Clip the last layer of the network"""
     
+    use_rehearsal: bool = False
+    rehearsal_coef: float = 0.01
     use_vcl: bool = False
     use_packnet: bool = False
 
@@ -215,6 +217,8 @@ class Args:
     parseval_coef: float = 0.01
     use_DiagonalLayer: bool = False
     use_inputScaling: bool = False
+
+    use_clip_l2: bool = False
 
     use_l2_loss: bool = False
     """Toggle for the usage of L2 init loss"""
@@ -444,7 +448,11 @@ if __name__ == "__main__":
         print(f"Training on environment: {args.env_ids[i]}")
         if i==0:
             if args.exp_type == "ppo_minatar":
-                agent=PPO_Conv_Agent(envs=envs,seed=args.seed,use_crelu=args.use_crelu, use_DiagonalLayer=args.use_DiagonalLayer, use_inputScaling=args.use_inputScaling).to(device)
+                agent=PPO_Conv_Agent(envs=envs,seed=args.seed,use_crelu=args.use_crelu, 
+                use_DiagonalLayer=args.use_DiagonalLayer, 
+                use_inputScaling=args.use_inputScaling,
+                use_clip_l2=args.use_clip_l2,
+                use_rehearsal=args.use_rehearsal).to(device)
                 if args.use_vcl:
                     agent=PPO_Conv_Agent_VCL(envs=envs,seed=args.seed).to(device)
                 if args.use_packnet:
@@ -551,6 +559,9 @@ if __name__ == "__main__":
 
                 next_done = np.logical_or(terminations, truncations)
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+
+                if args.use_rehearsal:
+                    agent.rehearsal_buffer.add(next_obs.clone(), action.clone())
 
                 episode_rewards.append(torch.tensor(reward).to(device).view(-1))
                 if args.exp_type == "ppo_metaworld":
@@ -709,9 +720,12 @@ if __name__ == "__main__":
                                 cumulative_return=cumulative_return[idx].item()
                             )
                         scaled_td_error = td_scaler.get_scaled_td_error(td_error)
-                        wandb.log({"td_error/td_mean": td_error.mean().item()}, step=global_step)
-                        wandb.log({"td_error/scaled_td_mean": scaled_td_error.mean().item()}, step=global_step)
-
+                        try:
+                            wandb.log({"td_error/td_mean": td_error.mean().item()}, step=global_step)
+                            wandb.log({"td_error/scaled_td_mean": scaled_td_error.mean().item()}, step=global_step)
+                        except:
+                            print("failed to log")
+                            
 
                     if args.clip_vloss:
                         if args.use_tderror:
@@ -745,6 +759,22 @@ if __name__ == "__main__":
                         l2_0_loss = agent.compute_l2_0_loss()
                         loss += args.l2_coef * l2_0_loss
                         writer.add_scalar(f"train/l2_0_loss", l2_0_loss, global_step)
+                    if args.use_clip_l2:
+                        clip_l2_0_loss = agent.compute_clipping_l2_loss()
+                        loss += args.l2_coef * clip_l2_0_loss
+                        writer.add_scalar(f"train/clip_l2_0_loss", clip_l2_0_loss, global_step)
+                    if args.use_rehearsal and i>0:
+                        buffer_samples = agent.rehearsal_buffer.sample(batch_size=100)
+                        if buffer_samples:
+                            obs_batch, action_batch = zip(*buffer_samples)
+                            obs_batch = torch.stack(obs_batch)
+                            action_batch = torch.stack(action_batch)
+                            rehearsal_loss = agent.perform_rehearsal_loss(obs_batch, action_batch)
+                        else:
+                            rehearsal_loss = 0.0
+
+                        loss += args.rehearsal_coef * rehearsal_loss
+                        writer.add_scalar(f"train/rehearsal_loss", rehearsal_loss.item(), global_step)
                     if args.use_ewc:
                         if i>0:
                             ewc_loss = agent.ewc_loss()

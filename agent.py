@@ -187,11 +187,20 @@ class PPO_metaworld_Agent(nn.Module):
         return action, log_prob_sum, entropy_sum, self.critic(x).unsqueeze(0)
 
 class PPO_Conv_Agent(nn.Module):
-    def __init__(self, envs, hidden_size=64, seed=None, use_crelu=False, use_DiagonalLayer=False, use_inputScaling=False):
+    def __init__(self, envs, hidden_size=64, seed=None, use_crelu=False, 
+    use_DiagonalLayer=False, use_inputScaling=False, use_clip_l2=False, beta=2.0,
+    use_rehearsal=False):
         super(PPO_Conv_Agent, self).__init__()
         self.use_crelu = use_crelu
         self.use_DiagonalLayer= use_DiagonalLayer
         self.use_inputScaling=use_inputScaling
+        self.use_clip_l2=use_clip_l2
+        self.use_rehearsal=use_rehearsal
+        if self.use_rehearsal:
+            self.rehearsal_buffer = RehearsalBuffer(buffer_size=1500000)
+        if self.use_clip_l2:
+            self.beta = beta
+            self.init_bounds = InitBounds()
         if seed is not None:
             torch.manual_seed(seed)
         if use_crelu:
@@ -249,6 +258,22 @@ class PPO_Conv_Agent(nn.Module):
         for layer in self.modules():
             if isinstance(layer, (nn.Linear, nn.Conv2d)):
                 layer.reset_parameters()
+
+    def save_policy_distributions(self, obs_batch):
+        batch_size, num_envs = obs_batch.shape[:2]
+        reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
+        logits, _ = self.forward(reshaped_obs)
+        
+        self.saved_distributions = logits.detach()
+
+    def perform_rehearsal_loss(self, obs_batch, action_batch):
+        # reshape: combine batch and environment dims
+        batch_size, num_envs = obs_batch.shape[:2]
+        reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
+        logits, _ = self.forward(reshaped_obs)
+        target_labels = self.saved_distributions.argmax(dim=-1)                     
+        loss = F.cross_entropy(logits, target_labels)
+        return loss
 
     def sample_initial_candidates(self, num_samples, mode="critic"):
         candidates = []
@@ -395,6 +420,18 @@ class PPO_Conv_Agent(nn.Module):
                 continue
             l2_0_loss += torch.sum(param ** 2)
         return 0.5 * l2_0_loss
+    
+    def compute_clipping_l2_loss(self):
+        l2_0_loss = 0.0
+        for name, param in self.named_parameters():
+            if not param.requires_grad or "layer_norm" in name or \
+               "init_params" in name or "original_last_layer_params" in name:
+                continue
+
+            bound = self.init_bounds.get(param)
+            mask = (param.abs() > self.beta * bound).float()
+            l2_0_loss += torch.sum(mask * (param ** 2))
+        return 0.5 * l2_0_loss
 
     def compute_l2_loss(self, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
         curr_critic_params = self.get_flat_params(self.critic_fc1, self.critic_fc2, self.critic_out)
@@ -462,67 +499,6 @@ class PPO_Conv_Agent(nn.Module):
                 ewc_loss += (self.fisher_information[name] *
                              (param - self.optimal_weights[name]) ** 2).sum()
         return ewc_loss
-
-
-# class PackNet_PPO_Conv_Agent(PPO_Conv_Agent):
-#     def __init__(self, envs, prune_perc=0.5, retrain_steps=10000, *args, **kwargs):
-#         super().__init__(envs, *args, **kwargs)
-#         self.prune_perc = prune_perc
-#         self.retrain_steps = retrain_steps
-#         self.current_task_idx = 0
-
-#         self.saved_masks = {}
-#         self.saved_weights = {}
-
-#     def save_masks_and_weights(self):
-#         self.saved_masks = {}
-#         self.saved_weights = {}
-#         for name, param in self.named_parameters():
-#             if "weight" in name and param.requires_grad:
-#                 mask = (param != 0).float()
-#                 self.saved_masks[name] = mask
-#                 self.saved_weights[name] = param.clone().detach()
-
-#     def apply_mask(self):
-#         for name, param in self.named_parameters():
-#             if name in self.saved_masks:
-#                 mask = self.saved_masks[name]
-#                 param.data *= mask
-
-#     def prune_weights(self):
-#         for name, param in self.named_parameters():
-#             if "weight" in name and param.requires_grad:
-#                 abs_param = torch.abs(param)
-#                 threshold = torch.quantile(abs_param, self.prune_perc)
-#                 mask = (abs_param > threshold).float()
-#                 param.data *= mask
-#                 self.saved_masks[name] = mask
-
-#     def retrain_after_pruning(self, optimizer, train_data_loader):
-#         for _ in range(self.retrain_steps):
-#             for batch in train_data_loader:
-#                 observations, actions, log_probs, returns = batch
-#                 optimizer.zero_grad()
-#                 loss = self.compute_loss(observations, actions, log_probs, returns)
-#                 loss.backward()
-#                 self.apply_mask()
-#                 optimizer.step()
-
-#     def compute_loss(self, observations, actions, log_probs, returns):
-#         _, new_log_probs, _, values = self.get_action_and_value(observations, actions)
-#         advantages = returns - values.flatten()
-#         pg_loss = -torch.mean(advantages * torch.exp(new_log_probs - log_probs))
-#         value_loss = torch.mean((values.flatten() - returns) ** 2)
-#         entropy_loss = torch.mean(-new_log_probs)
-#         return pg_loss + value_loss - entropy_loss
-
-#     def train_with_packnet(self, optimizer, observations, actions, log_probs, returns, train_data_loader):
-#         self.retrain_after_pruning(optimizer, train_data_loader)
-#         self.save_masks_and_weights()
-
-#     def on_task_end(self):
-#         self.prune_weights()
-#         self.current_task_idx += 1
 
 class PPO_Conv_Agent_VCL(nn.Module):
     def __init__(self, envs, hidden_size=64, cl_reg_coef=1, seed=None):
@@ -751,6 +727,20 @@ class PPO_PackNet_Agent(nn.Module):
 
     def before_update(self):
         self.packnet.adjust_gradients(retrain_mode=self.retrain_mode)
+
+
+class RehearsalBuffer:
+    def __init__(self, buffer_size):
+        self.buffer = []
+        self.buffer_size = buffer_size
+
+    def add(self, obs, actions):
+        if len(self.buffer) >= self.buffer_size:
+            self.buffer.pop(0)
+        self.buffer.append((obs, actions))
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, min(batch_size, len(self.buffer)))
 
 class InitBounds:
     '''
