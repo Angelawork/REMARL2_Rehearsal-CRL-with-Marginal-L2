@@ -197,7 +197,7 @@ class PPO_Conv_Agent(nn.Module):
         self.use_clip_l2=use_clip_l2
         self.use_rehearsal=use_rehearsal
         if self.use_rehearsal:
-            self.rehearsal_buffer = RehearsalBuffer(buffer_size=1500000)
+            self.game_buffers = {}
         if self.use_clip_l2:
             self.beta = beta
             self.init_bounds = InitBounds()
@@ -258,23 +258,75 @@ class PPO_Conv_Agent(nn.Module):
         for layer in self.modules():
             if isinstance(layer, (nn.Linear, nn.Conv2d)):
                 layer.reset_parameters()
-
-    def save_policy_distributions(self, obs_batch):
-        batch_size, num_envs = obs_batch.shape[:2]
-        reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
-        logits, _ = self.forward(reshaped_obs)
+    
+    def save_obs_distribution(self, game_id):
+        if game_id not in self.game_buffers:
+            raise ValueError(f"No observations found for game ID {game_id}.")
+        buffer = self.game_buffers[game_id]
         
-        self.saved_distributions = logits.detach()
+        new_obs = []
+        idx = []
+        for i, (obs, dist) in enumerate(buffer.buffer):
+            if dist is None:
+                new_obs.append(obs)
+                idx.append(i)
+        if not new_obs:
+            print(f"No observations with missing distributions for game ID {game_id}.")
+            return
 
-    def perform_rehearsal_loss(self, obs_batch, action_batch):
+        obs_batch = torch.stack(new_obs)
+        with torch.no_grad():
+            batch_size, num_envs = obs_batch.shape[:2]
+            reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
+            logits, _ = self.forward(reshaped_obs)
+            distributions = logits.detach()
+        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=1500000)
+        for obs, dist in zip(reshaped_obs, distributions):
+            self.game_buffers[game_id].add(obs, dist)
+
+    def add_obs(self, game_id, obs, dist=None):
+        if game_id not in self.game_buffers:
+            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=1500000)
+        self.game_buffers[game_id].add(obs.clone(), dist)
+
+    def sample_uniform_per_game(self, curr_game_id, batch_size):
+        previous_game_ids = range(0, curr_game_id)
+        buffers = [
+                self.game_buffers[game_id]
+                for game_id in previous_game_ids if game_id in self.game_buffers
+            ]
+
+        if not buffers:
+            raise ValueError(f"No buffers found for previous games for curr_game_id={curr_game_id}")
+        # uniform probability for sample from combined buffer
+        num_games = len(buffers)
+        samples_per_game = batch_size // num_games
+        extra_samples = batch_size % num_games
+
+        sampled_obs = []
+        sampled_distri = []
+        for i, buffer in enumerate(buffers):
+            obs, distri = zip(*buffer.buffer)
+            obs = torch.stack(obs)
+            distri = torch.stack(distri)
+            num_samples = samples_per_game + (1 if i < extra_samples else 0)
+
+            indices = torch.randperm(obs.size(0))[:num_samples]
+
+            sampled_obs.append(obs[indices])
+            sampled_distri.append(distri[indices])
+
+        obs_batch = torch.cat(sampled_obs, dim=0)
+        distri_batch = torch.cat(sampled_distri, dim=0)
+
+        return obs_batch, distri_batch
+
+    def perform_rehearsal_loss(self, obs_batch, distributions):
         # reshape: combine batch and environment dims
-        batch_size, num_envs = obs_batch.shape[:2]
-        reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
-        logits, _ = self.forward(reshaped_obs)
-        target_labels = self.saved_distributions.argmax(dim=-1)                     
-        loss = F.cross_entropy(logits, target_labels)
+        logits, _ = self.forward(obs_batch)      
+        loss = F.cross_entropy(logits, distributions.argmax(dim=-1))
         return loss
-
+        
     def sample_initial_candidates(self, num_samples, mode="critic"):
         candidates = []
         for _ in range(num_samples):
@@ -636,7 +688,7 @@ class PackNet(nn.Module):
                 # sort the unassigned weights from lower to higher magnitudes
                 masked = p * (mask == 0)  # only select "free" weights
                 flat = masked.flatten()
-                _sorted, indices = torch.sort(
+                _sorted, idx = torch.sort(
                     flat.abs(), descending=True
                 )  # sort from max to min magnitude
                 n_prune = int(
@@ -644,7 +696,7 @@ class PackNet(nn.Module):
                 )  # number of weights to keep in pruning
 
                 # create the mask
-                mask.flatten()[indices[:n_prune]] = self.task_id
+                mask.flatten()[idx[:n_prune]] = self.task_id
 
     @torch.no_grad()
     def apply_mask(self):
@@ -734,13 +786,15 @@ class RehearsalBuffer:
         self.buffer = []
         self.buffer_size = buffer_size
 
-    def add(self, obs, actions):
+    def add(self, obs, distribution):
         if len(self.buffer) >= self.buffer_size:
             self.buffer.pop(0)
-        self.buffer.append((obs, actions))
+        self.buffer.append((obs, distribution))
 
     def sample(self, batch_size):
-        return random.sample(self.buffer, min(batch_size, len(self.buffer)))
+        samples = random.sample(self.buffer, min(batch_size, len(self.buffer)))
+        obs_batch, logits_batch = zip(*samples)
+        return torch.stack(obs_batch), torch.stack(logits_batch)
 
 class InitBounds:
     '''

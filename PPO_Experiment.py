@@ -197,6 +197,8 @@ class Args:
     
     use_rehearsal: bool = False
     rehearsal_coef: float = 0.01
+    rehearsal_batch: int = 50
+
     use_vcl: bool = False
     use_packnet: bool = False
 
@@ -561,7 +563,7 @@ if __name__ == "__main__":
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
                 if args.use_rehearsal:
-                    agent.rehearsal_buffer.add(next_obs.clone(), action.clone())
+                    agent.add_obs(game_id=i,obs=next_obs.clone())
 
                 episode_rewards.append(torch.tensor(reward).to(device).view(-1))
                 if args.exp_type == "ppo_metaworld":
@@ -764,14 +766,10 @@ if __name__ == "__main__":
                         loss += args.l2_coef * clip_l2_0_loss
                         writer.add_scalar(f"train/clip_l2_0_loss", clip_l2_0_loss, global_step)
                     if args.use_rehearsal and i>0:
-                        buffer_samples = agent.rehearsal_buffer.sample(batch_size=100)
-                        if buffer_samples:
-                            obs_batch, action_batch = zip(*buffer_samples)
-                            obs_batch = torch.stack(obs_batch)
-                            action_batch = torch.stack(action_batch)
-                            rehearsal_loss = agent.perform_rehearsal_loss(obs_batch, action_batch)
-                        else:
-                            rehearsal_loss = 0.0
+                        obs_batch, distri_batch = agent.sample_uniform_per_game(
+                            curr_game_id=i, batch_size=args.rehearsal_batch
+                        )
+                        rehearsal_loss = agent.perform_rehearsal_loss(obs_batch, distri_batch)
 
                         loss += args.rehearsal_coef * rehearsal_loss
                         writer.add_scalar(f"train/rehearsal_loss", rehearsal_loss.item(), global_step)
@@ -836,6 +834,8 @@ if __name__ == "__main__":
             agent.store_optimal_weights()
         if args.use_vcl:
             agent.update_priors()
+        if args.use_rehearsal:
+            agent.save_obs_distribution(game_id=i)
         
         envs.close()
     writer.close()
