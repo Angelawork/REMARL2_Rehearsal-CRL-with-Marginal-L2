@@ -275,19 +275,29 @@ class PPO_Conv_Agent(nn.Module):
             return
 
         obs_batch = torch.stack(new_obs)
+        print("start computing dist!")
         with torch.no_grad():
             batch_size, num_envs = obs_batch.shape[:2]
             reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
-            logits, _ = self.forward(reshaped_obs)
+
+            sub_batch_size = 2
+            sub_batches = reshaped_obs.split(sub_batch_size)
+            
+            logits_list = []
+            for sub_batch in sub_batches:
+                logits, _ = self.forward(sub_batch)
+                logits_list.append(logits)
+
+            logits = torch.cat(logits_list, dim=0)
             distributions = logits.detach()
-        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=1500000)
+        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=20000)
         for obs, dist in zip(reshaped_obs, distributions):
             self.game_buffers[game_id].add(obs, dist)
 
     def add_obs(self, game_id, obs, dist=None):
         if game_id not in self.game_buffers:
-            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=1500000)
-        self.game_buffers[game_id].add(obs.clone(), dist)
+            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=20000)
+        self.game_buffers[game_id].add(obs.clone().detach(), dist)
 
     def sample_uniform_per_game(self, curr_game_id, batch_size):
         previous_game_ids = range(0, curr_game_id)
@@ -323,9 +333,18 @@ class PPO_Conv_Agent(nn.Module):
 
     def perform_rehearsal_loss(self, obs_batch, distributions):
         # reshape: combine batch and environment dims
-        logits, _ = self.forward(obs_batch)      
-        loss = F.cross_entropy(logits, distributions.argmax(dim=-1))
-        return loss
+        total_loss = 0
+
+        sub_batch_size = 32
+        sub_batches_obs = obs_batch.split(sub_batch_size)
+        sub_batches_dist = distributions.split(sub_batch_size)
+
+        for sub_batch_obs, sub_batch_dist in zip(sub_batches_obs, sub_batches_dist):
+            logits, _ = self.forward(sub_batch_obs)
+            loss = F.cross_entropy(logits, sub_batch_dist.argmax(dim=-1))
+            total_loss += loss
+
+        return total_loss
         
     def sample_initial_candidates(self, num_samples, mode="critic"):
         candidates = []
