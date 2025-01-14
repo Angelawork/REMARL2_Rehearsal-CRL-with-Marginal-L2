@@ -280,7 +280,7 @@ class PPO_Conv_Agent(nn.Module):
             batch_size, num_envs = obs_batch.shape[:2]
             reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
 
-            sub_batch_size = 2
+            sub_batch_size = 4
             sub_batches = reshaped_obs.split(sub_batch_size)
             
             logits_list = []
@@ -290,13 +290,13 @@ class PPO_Conv_Agent(nn.Module):
 
             logits = torch.cat(logits_list, dim=0)
             distributions = logits.detach()
-        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=20000)
+        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=10000)
         for obs, dist in zip(reshaped_obs, distributions):
             self.game_buffers[game_id].add(obs, dist)
 
     def add_obs(self, game_id, obs, dist=None):
         if game_id not in self.game_buffers:
-            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=20000)
+            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=10000)
         self.game_buffers[game_id].add(obs.clone().detach(), dist)
 
     def sample_uniform_per_game(self, curr_game_id, batch_size):
@@ -309,7 +309,7 @@ class PPO_Conv_Agent(nn.Module):
         if not buffers:
             raise ValueError(f"No buffers found for previous games for curr_game_id={curr_game_id}")
         # uniform probability for sample from combined buffer
-        num_games = len(buffers)
+        num_games = curr_game_id
         samples_per_game = batch_size // num_games
         extra_samples = batch_size % num_games
 
@@ -335,7 +335,7 @@ class PPO_Conv_Agent(nn.Module):
         # reshape: combine batch and environment dims
         total_loss = 0
 
-        sub_batch_size = 32
+        sub_batch_size = 4
         sub_batches_obs = obs_batch.split(sub_batch_size)
         sub_batches_dist = distributions.split(sub_batch_size)
 

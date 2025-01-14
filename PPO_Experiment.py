@@ -563,7 +563,7 @@ if __name__ == "__main__":
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
                 if args.use_rehearsal:
-                    agent.add_obs(game_id=i,obs=next_obs.clone())
+                    agent.add_obs(game_id=i,obs=next_obs.clone().detach())
 
                 episode_rewards.append(torch.tensor(reward).to(device).view(-1))
                 if args.exp_type == "ppo_metaworld":

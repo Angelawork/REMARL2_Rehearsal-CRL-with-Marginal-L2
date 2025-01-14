@@ -1,12 +1,11 @@
 #!/bin/bash
 
-#SBATCH --job-name=0.01_rehearsal
-#SBATCH --output=out/0.01_rehearsal__%j.out
-#SBATCH --gres=gpu:1
+#SBATCH --job-name=0.01_new_rehearsal
+#SBATCH --output=out/0.01_new_rehearsal__%j.out
+#SBATCH --gres=gpu:rtx8000:1
 #SBATCH --time=90:00:00
- #SBATCH --gpus-per-task=rtx8000:1
- #SBATCH --cpus-per-task=6
- #SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=6
+#SBATCH --ntasks-per-node=1
 #SBATCH --mem=50G
 
 seed=$1
@@ -48,17 +47,18 @@ python -c "import wandb; wandb.login(key='$WANDB_API_KEY')"
 # MinAtar/Breakout-v0 MinAtar/Freeway-v0 MinAtar/Asterix-v0 MinAtar/Seaquest-v0 MinAtar/SpaceInvaders-v0
 #candidate l2 need use-l2-loss to be True
 python PPO_Experiment.py --exp-type="ppo_minatar" \
-        --exp-name="10_clip_l2_0" \
+        --exp-name="0.01_rehearsal_uniform_16batch" \
         --env-ids "MinAtar/Breakout-v0" "MinAtar/Freeway-v0" "MinAtar/Asterix-v0" "MinAtar/Seaquest-v0" "MinAtar/SpaceInvaders-v0" \
         --wandb-project-name="PPO_minatar" \
         --seed=$seed \
         --use-vcl=False \
-        --use-rehearsal=False \
+        --use-rehearsal=True \
         --rehearsal-coef=0.01 \
+        --rehearsal-batch=16 \
         --use-packnet=False \
         --use-tderror=False \
         --global-tderror=False \
-        --use-clip-l2=True \
+        --use-clip-l2=False \
         --use-l2-loss=$l2_loss \
         --use-l2-0-loss=False \
         --l2-coef=10 \
