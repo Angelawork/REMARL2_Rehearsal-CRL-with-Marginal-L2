@@ -203,7 +203,7 @@ class PPO_Conv_Agent(nn.Module):
             self.init_bounds = InitBounds()
         if seed is not None:
             torch.manual_seed(seed)
-        if use_crelu:
+        if self.use_crelu:
             self.fc_activation_fn = CReLU()
             self.conv_activation_fn = ConvCReLU() 
         input_channels = envs.single_observation_space.shape[0] 
@@ -212,7 +212,7 @@ class PPO_Conv_Agent(nn.Module):
         self.conv = nn.Conv2d(in_channels=input_channels, out_channels=32, kernel_size=2)
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
         self.fc1 = nn.Linear(512, hidden_size)
-        if use_crelu:
+        if self.use_crelu:
             self.fc1 = nn.Linear(512*2, hidden_size)
             self.actor_fc1 = nn.Linear(hidden_size * 2, hidden_size)
             self.actor_fc2 = nn.Linear(hidden_size * 2, hidden_size)
@@ -260,6 +260,7 @@ class PPO_Conv_Agent(nn.Module):
                 layer.reset_parameters()
     
     def save_obs_distribution(self, game_id):
+        device= torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if game_id not in self.game_buffers:
             raise ValueError(f"No observations found for game ID {game_id}.")
         buffer = self.game_buffers[game_id]
@@ -274,30 +275,24 @@ class PPO_Conv_Agent(nn.Module):
             print(f"No observations with missing distributions for game ID {game_id}.")
             return
 
-        obs_batch = torch.stack(new_obs)
-        print("start computing dist!")
-        with torch.no_grad():
-            batch_size, num_envs = obs_batch.shape[:2]
-            reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
-
-            sub_batch_size = 4
-            sub_batches = reshaped_obs.split(sub_batch_size)
+        sub_batch_size = 4
+        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=100000)
+        for start_idx in range(0, len(new_obs), sub_batch_size):
+            obs_batch = torch.stack(new_obs[start_idx:start_idx + sub_batch_size])
+            with torch.no_grad():
+                batch_size, num_envs = obs_batch.shape[:2]
+                reshaped_obs = obs_batch.view(batch_size * num_envs, *obs_batch.shape[2:])
+                reshaped_obs=reshaped_obs.to(device)
+                logits, _ = self.forward(reshaped_obs)
+                distributions = logits.detach().cpu()
             
-            logits_list = []
-            for sub_batch in sub_batches:
-                logits, _ = self.forward(sub_batch)
-                logits_list.append(logits)
-
-            logits = torch.cat(logits_list, dim=0)
-            distributions = logits.detach()
-        self.game_buffers[game_id]=RehearsalBuffer(buffer_size=10000)
-        for obs, dist in zip(reshaped_obs, distributions):
-            self.game_buffers[game_id].add(obs, dist)
+            for obs, dist in zip(reshaped_obs.cpu(), distributions):
+                self.game_buffers[game_id].add(obs, dist)
 
     def add_obs(self, game_id, obs, dist=None):
         if game_id not in self.game_buffers:
-            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=10000)
-        self.game_buffers[game_id].add(obs.clone().detach(), dist)
+            self.game_buffers[game_id]=RehearsalBuffer(buffer_size=100000)
+        self.game_buffers[game_id].add(obs.clone().detach().cpu(), dist.cpu() if dist is not None else dist)
 
     def sample_uniform_per_game(self, curr_game_id, batch_size):
         previous_game_ids = range(0, curr_game_id)
@@ -332,6 +327,9 @@ class PPO_Conv_Agent(nn.Module):
         return obs_batch, distri_batch
 
     def perform_rehearsal_loss(self, obs_batch, distributions):
+        device= torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        obs_batch = obs_batch.to(device)
+        distributions = distributions.to(device)
         # reshape: combine batch and environment dims
         total_loss = 0
 
@@ -428,7 +426,7 @@ class PPO_Conv_Agent(nn.Module):
             critic_value = self.fc_activation_fn(self.critic_fc1(x))
             critic_value = self.fc_activation_fn(self.critic_fc2(critic_value))
             critic_value = self.critic_out(critic_value)
-        if self.use_DiagonalLayer:
+        elif self.use_DiagonalLayer:
             x = F.relu(self.conv(x))
             x = self.pool(x)
 
