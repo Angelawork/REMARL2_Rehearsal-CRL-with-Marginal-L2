@@ -33,3 +33,5 @@ methods mitigate non-stationarity by adjusting for environmental changes but emp
 plasticity over stability, leading to performance instability. These limitations highlight the
 need for a more balanced approach.
 
+### [📄 View the report (PDF)](https://github.com/Angelawork/REMARL2_Rehearsal-CRL-with-Marginal-L2/blob/main/Plasticity_and_Stability_in_Continual_RL.pdf)
+
